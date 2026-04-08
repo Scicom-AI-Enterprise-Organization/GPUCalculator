@@ -37,6 +37,12 @@ const CONTEXT_OPTIONS = [
   { value: 131072, label: "128K" },
 ];
 
+interface MoeConfig {
+  numExperts: number;
+  activeExperts: number;
+  sharedExperts: number;
+}
+
 interface ModelConfig {
   modelName: string;
   numLayers: number;
@@ -46,6 +52,7 @@ interface ModelConfig {
   headDim: number;
   intermediateSize: number;
   vocabSize: number;
+  moe: MoeConfig | null;
 }
 
 interface EstimationResult {
@@ -59,22 +66,19 @@ interface EstimationResult {
   utilizationPercent: number;
   kvPerTokenBytes: number;
   usingHfConfig: boolean;
+  activeParamsB: number;
+  isMoe: boolean;
 }
 
 function resolveHfUrl(url: string): string {
-  // Convert blob URLs to resolve URLs for raw file access
-  // https://huggingface.co/org/model/blob/main/config.json
-  // → https://huggingface.co/org/model/resolve/main/config.json
   let resolved = url.trim();
   resolved = resolved.replace("/blob/", "/resolve/");
 
-  // If user just pastes a model page URL without config.json, append it
   if (!resolved.includes("config.json")) {
     if (!resolved.endsWith("/")) resolved += "/";
     resolved += "resolve/main/config.json";
   }
 
-  // Ensure it uses /resolve/
   if (!resolved.includes("/resolve/")) {
     resolved = resolved.replace(
       /huggingface\.co\/([^/]+\/[^/]+)\/?$/,
@@ -94,13 +98,23 @@ function extractConfig(json: any): ModelConfig {
   const hiddenSize = cfg.hidden_size ?? cfg.n_embd ?? 4096;
   const headDim = cfg.head_dim ?? Math.floor(hiddenSize / numAttentionHeads);
 
-  // Extract model name from model_type or architectures
   let modelName = cfg.model_type || "";
   if (json.architectures?.length) {
     modelName = json.architectures[0].replace(/ForCausalLM$/, "");
   }
   if (json._name_or_path) {
     modelName = json._name_or_path;
+  }
+
+  // Detect MoE configuration
+  let moe: MoeConfig | null = null;
+  const numExperts = cfg.num_local_experts ?? cfg.n_routed_experts ?? cfg.num_experts ?? null;
+  if (numExperts && numExperts > 1) {
+    moe = {
+      numExperts,
+      activeExperts: cfg.num_experts_per_tok ?? cfg.num_selected_experts ?? cfg.top_k ?? 2,
+      sharedExperts: cfg.n_shared_experts ?? cfg.num_shared_experts ?? 0,
+    };
   }
 
   return {
@@ -112,7 +126,25 @@ function extractConfig(json: any): ModelConfig {
     headDim,
     intermediateSize: cfg.intermediate_size ?? cfg.n_inner ?? hiddenSize * 4,
     vocabSize: cfg.vocab_size ?? 32000,
+    moe,
   };
+}
+
+function computeActiveRatio(
+  isMoe: boolean,
+  numExperts: number,
+  activeExperts: number,
+  sharedExperts: number
+): number {
+  if (!isMoe || numExperts <= 1) return 1;
+  // In a typical MoE transformer:
+  // - Attention layers + embeddings + norm ≈ shared params (~35-40%)
+  // - FFN/expert layers ≈ expert params (~60-65%)
+  // Active params = shared + (active_experts + shared_experts) / total_experts * expert_portion
+  const sharedFraction = 0.35;
+  const expertFraction = 1 - sharedFraction;
+  const activeExpertRatio = Math.min((activeExperts + sharedExperts) / numExperts, 1);
+  return sharedFraction + expertFraction * activeExpertRatio;
 }
 
 function estimateGpus(
@@ -122,32 +154,39 @@ function estimateGpus(
   contextLength: number,
   gpuType: string,
   concurrentRequests: number,
-  hfConfig: ModelConfig | null
+  hfConfig: ModelConfig | null,
+  isMoe: boolean,
+  moeNumExperts: number,
+  moeActiveExperts: number,
+  moeSharedExperts: number
 ): EstimationResult {
   const q = PRECISION[quant];
   const kv = KV_PRECISION[kvPrecision];
   const gpu = GPU_SPECS[gpuType];
 
-  // Model weights VRAM
+  // Model weights VRAM — all weights must be in memory regardless of MoE
   const modelVram = paramsB * q.bytesPerParam;
+
+  // Active parameters for overhead/activation calculation
+  const activeRatio = computeActiveRatio(isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts);
+  const activeParamsB = paramsB * activeRatio;
 
   // KV cache estimation
   let kvPerTokenBytes: number;
   if (hfConfig) {
-    // Precise: 2 (K+V) * num_layers * num_kv_heads * head_dim * bytes
     kvPerTokenBytes = 2 * hfConfig.numLayers * hfConfig.numKvHeads * hfConfig.headDim * kv.bytes;
   } else {
-    // Rough empirical estimate (baseline is bf16 = 2 bytes)
+    // Use active params for KV estimate since attention is shared (not affected by MoE)
     kvPerTokenBytes = paramsB * 0.00003 * 1e9 * (kv.bytes / 2);
   }
   const kvCacheVram = (kvPerTokenBytes * contextLength * concurrentRequests) / 1e9;
 
-  // Framework overhead (~10% of model weights)
-  const overheadVram = modelVram * 0.1;
+  // Framework overhead — based on active params, not total
+  // For MoE, only active experts contribute to activation memory
+  const overheadVram = activeParamsB * q.bytesPerParam * 0.1;
 
   const totalVram = modelVram + kvCacheVram + overheadVram;
 
-  // Calculate number of GPUs needed
   const rawGpus = totalVram / gpu.vram;
   let numGpus: number;
   if (rawGpus <= 1) {
@@ -157,7 +196,6 @@ function estimateGpus(
     while (numGpus < rawGpus) numGpus *= 2;
   }
 
-  // TP recommendation
   let tpRecommendation: string;
   if (numGpus === 1) {
     tpRecommendation = "No parallelism needed";
@@ -184,6 +222,8 @@ function estimateGpus(
     utilizationPercent,
     kvPerTokenBytes,
     usingHfConfig: hfConfig !== null,
+    activeParamsB,
+    isMoe,
   };
 }
 
@@ -217,6 +257,12 @@ export function GpuEstimator() {
   const [gpuType, setGpuType] = useState("h100");
   const [concurrentRequests, setConcurrentRequests] = useState(10);
 
+  // MoE settings
+  const [isMoe, setIsMoe] = useState(false);
+  const [moeNumExperts, setMoeNumExperts] = useState(8);
+  const [moeActiveExperts, setMoeActiveExperts] = useState(2);
+  const [moeSharedExperts, setMoeSharedExperts] = useState(0);
+
   // HuggingFace config
   const [hfUrl, setHfUrl] = useState("");
   const [hfConfig, setHfConfig] = useState<ModelConfig | null>(null);
@@ -239,6 +285,16 @@ export function GpuEstimator() {
       const json = await res.json();
       const config = extractConfig(json);
       setHfConfig(config);
+
+      // Auto-populate MoE fields if detected
+      if (config.moe) {
+        setIsMoe(true);
+        setMoeNumExperts(config.moe.numExperts);
+        setMoeActiveExperts(config.moe.activeExperts);
+        setMoeSharedExperts(config.moe.sharedExperts);
+      } else {
+        setIsMoe(false);
+      }
     } catch (e) {
       setHfError(e instanceof Error ? e.message : "Failed to fetch config");
     } finally {
@@ -253,8 +309,14 @@ export function GpuEstimator() {
   }, []);
 
   const result = useMemo(
-    () => estimateGpus(paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests, hfConfig),
-    [paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests, hfConfig]
+    () =>
+      estimateGpus(
+        paramsB, quant, kvPrecision, contextLength, gpuType,
+        concurrentRequests, hfConfig,
+        isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts
+      ),
+    [paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests, hfConfig,
+     isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts]
   );
 
   return (
@@ -271,7 +333,7 @@ export function GpuEstimator() {
               <span className="text-xs font-normal text-muted-foreground">(optional)</span>
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
-              Paste a link to a model&apos;s config.json for precise KV cache estimation using actual layer count and head dimensions.
+              Paste a link to a model&apos;s config.json for precise KV cache estimation and auto-detection of MoE architecture.
             </p>
             <div className="flex gap-2">
               <input
@@ -296,7 +358,6 @@ export function GpuEstimator() {
               </button>
             </div>
 
-            {/* Status */}
             {hfError && (
               <div className="mt-2 flex items-center gap-1.5 text-xs text-red-500">
                 <XCircle className="h-3.5 w-3.5" />
@@ -330,6 +391,12 @@ export function GpuEstimator() {
                   <span>KV heads: <span className="font-semibold">{hfConfig.numKvHeads}</span></span>
                   <span>Head dim: <span className="font-semibold">{hfConfig.headDim}</span></span>
                   <span>Vocab: <span className="font-semibold">{hfConfig.vocabSize.toLocaleString()}</span></span>
+                  {hfConfig.moe && (
+                    <>
+                      <span>Experts: <span className="font-semibold">{hfConfig.moe.numExperts}</span></span>
+                      <span>Active: <span className="font-semibold">{hfConfig.moe.activeExperts}{hfConfig.moe.sharedExperts > 0 ? ` + ${hfConfig.moe.sharedExperts} shared` : ""}</span></span>
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -339,6 +406,11 @@ export function GpuEstimator() {
           <div>
             <label className="mb-1.5 block text-sm font-medium">
               Model Size: <span className="text-primary">{paramsB}B</span> parameters
+              {isMoe && (
+                <span className="ml-1 text-xs font-normal text-muted-foreground">
+                  (active: ~{result.activeParamsB.toFixed(1)}B)
+                </span>
+              )}
             </label>
             <input
               type="range"
@@ -355,6 +427,69 @@ export function GpuEstimator() {
               <span>500B</span>
               <span>1000B</span>
             </div>
+          </div>
+
+          {/* MoE Toggle & Config */}
+          <div>
+            <div className="mb-1.5 flex items-center gap-2">
+              <label className="text-sm font-medium">Mixture of Experts (MoE)</label>
+              <button
+                onClick={() => setIsMoe(!isMoe)}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  isMoe ? "bg-primary" : "bg-muted-foreground/30"
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                    isMoe ? "translate-x-4" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            {isMoe && (
+              <div className="mt-2 rounded-lg border border-border bg-muted/30 p-3">
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="mb-1 block text-[11px] text-muted-foreground">Total Experts</label>
+                    <input
+                      type="number"
+                      min={2}
+                      max={256}
+                      value={moeNumExperts}
+                      onChange={(e) => setMoeNumExperts(Math.max(2, Number(e.target.value)))}
+                      className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] text-muted-foreground">Active / Token</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={moeNumExperts}
+                      value={moeActiveExperts}
+                      onChange={(e) => setMoeActiveExperts(Math.max(1, Math.min(moeNumExperts, Number(e.target.value))))}
+                      className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] text-muted-foreground">Shared Experts</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={moeNumExperts}
+                      value={moeSharedExperts}
+                      onChange={(e) => setMoeSharedExperts(Math.max(0, Number(e.target.value)))}
+                      className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
+                    />
+                  </div>
+                </div>
+                <p className="mt-2 text-[10px] text-muted-foreground">
+                  All {paramsB}B weights stay in VRAM, but only ~{result.activeParamsB.toFixed(1)}B are active per token.
+                  Activation overhead is based on active parameters.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Precision */}
@@ -483,7 +618,7 @@ export function GpuEstimator() {
               color="#f97316"
             />
             <VramBar
-              label="Overhead"
+              label={result.isMoe ? "Overhead (active)" : "Overhead"}
               value={result.overheadVram}
               total={result.numGpus * result.gpuVram}
               color="#6b7280"
@@ -520,6 +655,15 @@ export function GpuEstimator() {
               <span>Model weights</span>
               <span>{paramsB}B &times; {PRECISION[quant].bytesPerParam} bytes/param = {result.modelVram.toFixed(1)} GB</span>
             </div>
+            {result.isMoe && (
+              <div className="flex justify-between">
+                <span>Active params (MoE)</span>
+                <span>
+                  ~{result.activeParamsB.toFixed(1)}B of {paramsB}B
+                  ({moeActiveExperts}{moeSharedExperts > 0 ? `+${moeSharedExperts}` : ""}/{moeNumExperts} experts)
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span>KV cache per token</span>
               <span>
@@ -536,7 +680,9 @@ export function GpuEstimator() {
             </div>
             <div className="flex justify-between">
               <span>Framework overhead</span>
-              <span>~10% of model = {result.overheadVram.toFixed(1)} GB</span>
+              <span>
+                ~10% of {result.isMoe ? `${result.activeParamsB.toFixed(1)}B active` : "model"} = {result.overheadVram.toFixed(1)} GB
+              </span>
             </div>
           </div>
         </div>
