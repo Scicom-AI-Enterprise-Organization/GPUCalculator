@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="1000"
+   height="491.9913"
+   viewBox="0 0 1000 491.99133"
+   version="1.1"
+   id="svg19"
+   sodipodi:docname="Telekom Malaysia 2023.svg"
+   inkscape:version="1.2.1 (9c6d41e410, 2022-07-14)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview21"
+     pagecolor="#ffffff"
+     bordercolor="#666666"
+     borderopacity="1.0"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     inkscape:zoom="0.5"
+     inkscape:cx="653"
+     inkscape:cy="238"
+     inkscape:window-width="1366"
+     inkscape:window-height="705"
+     inkscape:window-x="-8"
+     inkscape:window-y="-8"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg19" />
+  <defs
+     id="defs7" />
+  <g
+     id="g1415">
+    <path
+       id="path1410"
+       style="fill:#e93c00;fill-opacity:1;stroke-width:22.4009"
+       d="M 908.25195 36.21875 C 883.98641 36.21875 856.39709 42.169869 828.65625 61.669922 C 796.9332 83.969213 771.3875 113.93514 752.7832 147.95703 C 825.38725 98.99494 912.89821 77.125322 1000 86.175781 C 990.04774 64.668852 955.06955 36.21875 908.25195 36.21875 z " />
+    <path
+       id="path1407"
+       style="fill:#fd7a00;fill-opacity:1;stroke-width:22.4009"
+       d="M 597.94727 0.021484375 C 504.9132 0.021484375 413.88614 27.032192 337.38086 79.970703 C 504.80491 52.507245 631.54662 64.278865 659.05859 109.51758 C 678.34201 141.22586 625.45703 190.16211 625.45703 190.16211 C 714.11965 179.7681 761.69433 123.73879 753.38867 77.013672 C 745.47612 32.500065 693.19573 0.021484375 597.94727 0.021484375 z " />
+    <path
+       style="fill:#1800e0;fill-opacity:1;stroke-width:22.4009"
+       d="M 397.66211,209.98633 V 491.96875 H 520.01562 V 353.41992 c 0,-3.44345 3.09762,-6.18359 6.54102,-6.18359 2.13216,0 4.40968,1.00235 5.44336,2.86719 l 78.64844,141.86523 h 60.48437 l 78.64844,-141.86523 c 1.03368,-1.86484 3.3112,-2.86719 5.44336,-2.86719 3.4434,0 6.54102,2.74014 6.54101,6.18359 V 491.96875 H 884.11914 V 209.98633 H 725.74609 c -4.95424,0 -9.3434,2.51655 -11.76171,6.87695 l -67.56055,121.81641 c -1.21483,2.19042 -3.36667,3.35937 -5.53321,3.35937 -2.16649,0 -4.31837,-1.16895 -5.5332,-3.35937 L 567.79688,216.86328 c -2.41833,-4.36041 -6.80748,-6.87695 -11.76172,-6.87695 z"
+       id="path1430" />
+    <path
+       style="fill:#1800e0;fill-opacity:1;stroke-width:22.4009"
+       d="m 0,209.98633 v 95.78515 h 114.93945 c 3.71184,-2.4e-4 6.72095,3.00887 6.72071,6.72071 V 491.96875 H 249.6582 V 312.35742 c 8.4e-4,-3.71107 3.00963,-6.71899 6.72071,-6.71875 h 114.93945 v -95.65234 z"
+       id="path1404" />
+  </g>
+</svg>
