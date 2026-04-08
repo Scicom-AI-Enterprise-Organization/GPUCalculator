@@ -10,9 +10,11 @@ RUN npm ci
 
 # Rebuild the source code only when needed
 FROM base AS builder
+RUN apk add --no-cache git
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+RUN rm -rf data/llm-benchmaq && git clone --depth 1 https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git data/llm-benchmaq
 
 RUN npm run build
 
