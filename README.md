@@ -59,9 +59,17 @@ Two approaches shown side by side:
 
 Sourced from [llm-benchmaq](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) as a git submodule under `data/llm-benchmaq/`.
 
+## Setup
+
 ```bash
-# sync latest data
-git submodule update --remote
+git clone --recurse-submodules https://github.com/Scicom-AI-Enterprise-Organization/GPUCalculator.git
+cd GPUCalculator
+```
+
+If already cloned without submodules:
+
+```bash
+git submodule update --init --remote
 ```
 
 ## Running Locally
