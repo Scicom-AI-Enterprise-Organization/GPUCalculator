@@ -3,28 +3,29 @@
 import { useState, useMemo, useCallback } from "react";
 import { Loader2, CheckCircle2, XCircle, Link as LinkIcon } from "lucide-react";
 
-const GPU_SPECS: Record<string, { vram: number; label: string }> = {
-  b200: { vram: 192, label: "B200 (192 GB)" },
-  h200: { vram: 141, label: "H200 SXM (141 GB)" },
-  h100: { vram: 80, label: "H100 SXM (80 GB)" },
-  a100_80: { vram: 80, label: "A100 SXM 80GB" },
-  a100_40: { vram: 40, label: "A100 PCIe 40GB" },
-  l40s: { vram: 48, label: "L40S (48 GB)" },
-  a10: { vram: 24, label: "A10 (24 GB)" },
-  rtx_4090: { vram: 24, label: "RTX 4090 (24 GB)" },
+// vram in GB, tflops = FP16 dense TFLOPS, bw = memory bandwidth in GB/s
+const GPU_SPECS: Record<string, { vram: number; tflops: number; bw: number; label: string }> = {
+  b200:     { vram: 192, tflops: 1800, bw: 8000, label: "B200 (192 GB)" },
+  h200:     { vram: 141, tflops: 989,  bw: 4800, label: "H200 SXM (141 GB)" },
+  h100:     { vram: 80,  tflops: 989,  bw: 3350, label: "H100 SXM (80 GB)" },
+  a100_80:  { vram: 80,  tflops: 312,  bw: 2039, label: "A100 SXM 80GB" },
+  a100_40:  { vram: 40,  tflops: 312,  bw: 1555, label: "A100 PCIe 40GB" },
+  l40s:     { vram: 48,  tflops: 362,  bw: 864,  label: "L40S (48 GB)" },
+  a10:      { vram: 24,  tflops: 125,  bw: 600,  label: "A10 (24 GB)" },
+  rtx_4090: { vram: 24,  tflops: 330,  bw: 1008, label: "RTX 4090 (24 GB)" },
 };
 
 const PRECISION: Record<string, { bytesPerParam: number; label: string }> = {
   fp32: { bytesPerParam: 4, label: "FP32" },
   bf16: { bytesPerParam: 2, label: "BF16 / FP16" },
-  fp8: { bytesPerParam: 1, label: "FP8" },
+  fp8:  { bytesPerParam: 1, label: "FP8" },
   int8: { bytesPerParam: 1, label: "INT8" },
   int4: { bytesPerParam: 0.5, label: "INT4 / GPTQ / AWQ" },
 };
 
 const KV_PRECISION: Record<string, { bytes: number; label: string }> = {
   bf16: { bytes: 2, label: "BF16 / FP16" },
-  fp8: { bytes: 1, label: "FP8" },
+  fp8:  { bytes: 1, label: "FP8" },
 };
 
 const CONTEXT_OPTIONS = [
@@ -68,6 +69,9 @@ interface EstimationResult {
   usingHfConfig: boolean;
   activeParamsB: number;
   isMoe: boolean;
+  ttftMs: number;
+  tpotMs: number;
+  e2eMs: number;
 }
 
 function resolveHfUrl(url: string): string {
@@ -91,7 +95,6 @@ function resolveHfUrl(url: string): string {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractConfig(json: any): ModelConfig {
-  // Some models (e.g. multimodal) nest text config
   const cfg = json.text_config || json;
 
   const numAttentionHeads = cfg.num_attention_heads ?? cfg.n_head ?? 32;
@@ -106,7 +109,6 @@ function extractConfig(json: any): ModelConfig {
     modelName = json._name_or_path;
   }
 
-  // Detect MoE configuration
   let moe: MoeConfig | null = null;
   const numExperts = cfg.num_local_experts ?? cfg.n_routed_experts ?? cfg.num_experts ?? null;
   if (numExperts && numExperts > 1) {
@@ -137,10 +139,6 @@ function computeActiveRatio(
   sharedExperts: number
 ): number {
   if (!isMoe || numExperts <= 1) return 1;
-  // In a typical MoE transformer:
-  // - Attention layers + embeddings + norm ≈ shared params (~35-40%)
-  // - FFN/expert layers ≈ expert params (~60-65%)
-  // Active params = shared + (active_experts + shared_experts) / total_experts * expert_portion
   const sharedFraction = 0.35;
   const expertFraction = 1 - sharedFraction;
   const activeExpertRatio = Math.min((activeExperts + sharedExperts) / numExperts, 1);
@@ -154,6 +152,8 @@ function estimateGpus(
   contextLength: number,
   gpuType: string,
   concurrentRequests: number,
+  inputTokens: number,
+  outputTokens: number,
   hfConfig: ModelConfig | null,
   isMoe: boolean,
   moeNumExperts: number,
@@ -164,25 +164,19 @@ function estimateGpus(
   const kv = KV_PRECISION[kvPrecision];
   const gpu = GPU_SPECS[gpuType];
 
-  // Model weights VRAM — all weights must be in memory regardless of MoE
   const modelVram = paramsB * q.bytesPerParam;
 
-  // Active parameters for overhead/activation calculation
   const activeRatio = computeActiveRatio(isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts);
   const activeParamsB = paramsB * activeRatio;
 
-  // KV cache estimation
   let kvPerTokenBytes: number;
   if (hfConfig) {
     kvPerTokenBytes = 2 * hfConfig.numLayers * hfConfig.numKvHeads * hfConfig.headDim * kv.bytes;
   } else {
-    // Use active params for KV estimate since attention is shared (not affected by MoE)
     kvPerTokenBytes = paramsB * 0.00003 * 1e9 * (kv.bytes / 2);
   }
   const kvCacheVram = (kvPerTokenBytes * contextLength * concurrentRequests) / 1e9;
 
-  // Framework overhead — based on active params, not total
-  // For MoE, only active experts contribute to activation memory
   const overheadVram = activeParamsB * q.bytesPerParam * 0.1;
 
   const totalVram = modelVram + kvCacheVram + overheadVram;
@@ -211,6 +205,29 @@ function estimateGpus(
 
   const utilizationPercent = (totalVram / (numGpus * gpu.vram)) * 100;
 
+  // --- Latency estimation ---
+
+  // TTFT (prefill phase — compute bound)
+  // FLOPs per token ≈ 2 * active_params (forward pass matmuls)
+  // Total prefill FLOPs = 2 * active_params * input_tokens
+  // GPU compute utilization ~30-50% in practice (TP overhead, attention, etc.)
+  const prefillUtilization = 0.35;
+  const prefillFlops = 2 * activeParamsB * 1e9 * inputTokens;
+  const totalComputeFlops = numGpus * gpu.tflops * 1e12 * prefillUtilization;
+  const ttftMs = (prefillFlops / totalComputeFlops) * 1000;
+
+  // TPOT (decode phase — memory bandwidth bound)
+  // Each decode step reads model weights from HBM
+  // For MoE, only active expert weights are read per token
+  const activeModelBytes = activeParamsB * q.bytesPerParam * 1e9;
+  const totalBandwidth = numGpus * gpu.bw * 1e9; // bytes/s
+  // Decode utilization is higher (~60-70%) since it's a simpler memory-bound operation
+  const decodeUtilization = 0.65;
+  const tpotMs = (activeModelBytes / (totalBandwidth * decodeUtilization)) * 1000;
+
+  // E2E latency for a single request
+  const e2eMs = ttftMs + outputTokens * tpotMs;
+
   return {
     modelVram,
     kvCacheVram,
@@ -224,6 +241,9 @@ function estimateGpus(
     usingHfConfig: hfConfig !== null,
     activeParamsB,
     isMoe,
+    ttftMs,
+    tpotMs,
+    e2eMs,
   };
 }
 
@@ -249,6 +269,12 @@ function VramBar({ label, value, total, color }: { label: string; value: number;
   );
 }
 
+function formatLatency(ms: number): string {
+  if (ms < 1) return `${(ms * 1000).toFixed(0)} us`;
+  if (ms < 1000) return `${ms.toFixed(1)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
 export function GpuEstimator() {
   const [paramsB, setParamsB] = useState(70);
   const [quant, setQuant] = useState("bf16");
@@ -256,6 +282,8 @@ export function GpuEstimator() {
   const [contextLength, setContextLength] = useState(8192);
   const [gpuType, setGpuType] = useState("h100");
   const [concurrentRequests, setConcurrentRequests] = useState(10);
+  const [inputTokens, setInputTokens] = useState(1024);
+  const [outputTokens, setOutputTokens] = useState(128);
 
   // MoE settings
   const [isMoe, setIsMoe] = useState(false);
@@ -286,7 +314,6 @@ export function GpuEstimator() {
       const config = extractConfig(json);
       setHfConfig(config);
 
-      // Auto-populate MoE fields if detected
       if (config.moe) {
         setIsMoe(true);
         setMoeNumExperts(config.moe.numExperts);
@@ -312,12 +339,15 @@ export function GpuEstimator() {
     () =>
       estimateGpus(
         paramsB, quant, kvPrecision, contextLength, gpuType,
-        concurrentRequests, hfConfig,
+        concurrentRequests, inputTokens, outputTokens, hfConfig,
         isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts
       ),
-    [paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests, hfConfig,
+    [paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests,
+     inputTokens, outputTokens, hfConfig,
      isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts]
   );
+
+  const gpu = GPU_SPECS[gpuType];
 
   return (
     <div className="grid gap-6 lg:grid-cols-2">
@@ -552,6 +582,35 @@ export function GpuEstimator() {
             </div>
           </div>
 
+          {/* Input / Output Tokens */}
+          <div>
+            <label className="mb-1.5 block text-sm font-medium">Request Shape</label>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-[11px] text-muted-foreground">Input Tokens</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={131072}
+                  value={inputTokens}
+                  onChange={(e) => setInputTokens(Math.max(1, Number(e.target.value)))}
+                  className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[11px] text-muted-foreground">Output Tokens</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={131072}
+                  value={outputTokens}
+                  onChange={(e) => setOutputTokens(Math.max(1, Number(e.target.value)))}
+                  className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
+                />
+              </div>
+            </div>
+          </div>
+
           {/* Concurrent Requests */}
           <div>
             <label className="mb-1.5 block text-sm font-medium">
@@ -599,6 +658,34 @@ export function GpuEstimator() {
           <div className="text-sm text-muted-foreground">Estimated GPUs Required</div>
           <div className="mt-1 text-5xl font-bold text-primary">{result.numGpus}</div>
           <div className="mt-2 text-sm text-muted-foreground">{result.tpRecommendation}</div>
+        </div>
+
+        {/* Latency Estimates */}
+        <div className="rounded-xl border border-border bg-card p-6">
+          <h4 className="mb-3 text-sm font-semibold">Estimated Latency</h4>
+          <div className="grid grid-cols-3 gap-3">
+            <div className="rounded-lg bg-muted/50 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
+              <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(result.ttftMs)}</div>
+              <div className="mt-0.5 text-[10px] text-muted-foreground">Time to first token</div>
+            </div>
+            <div className="rounded-lg bg-muted/50 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TPOT</div>
+              <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(result.tpotMs)}</div>
+              <div className="mt-0.5 text-[10px] text-muted-foreground">Per output token</div>
+            </div>
+            <div className="rounded-lg bg-muted/50 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">E2E</div>
+              <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(result.e2eMs)}</div>
+              <div className="mt-0.5 text-[10px] text-muted-foreground">{inputTokens} in / {outputTokens} out</div>
+            </div>
+          </div>
+          <p className="mt-3 text-[10px] text-muted-foreground">
+            Single request estimate. Prefill is compute-bound (~35% utilization of {gpu.tflops} TFLOPS).
+            Decode is memory-bandwidth-bound (~65% utilization of {gpu.bw} GB/s).
+            {isMoe && ` MoE decode reads only active weights (~${result.activeParamsB.toFixed(1)}B).`}
+            {" "}Actual latency varies with batching, framework, and hardware thermals.
+          </p>
         </div>
 
         {/* VRAM Breakdown */}
@@ -683,6 +770,14 @@ export function GpuEstimator() {
               <span>
                 ~10% of {result.isMoe ? `${result.activeParamsB.toFixed(1)}B active` : "model"} = {result.overheadVram.toFixed(1)} GB
               </span>
+            </div>
+            <div className="mt-1 border-t border-border pt-2 flex justify-between">
+              <span>TTFT</span>
+              <span>2 &times; {result.activeParamsB.toFixed(1)}B &times; {inputTokens.toLocaleString()} tokens / ({result.numGpus} &times; {gpu.tflops} TFLOPS &times; 35%)</span>
+            </div>
+            <div className="flex justify-between">
+              <span>TPOT</span>
+              <span>{(result.activeParamsB * PRECISION[quant].bytesPerParam).toFixed(1)} GB / ({result.numGpus} &times; {gpu.bw} GB/s &times; 65%)</span>
             </div>
           </div>
         </div>
