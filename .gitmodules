@@ -1,0 +1,3 @@
+[submodule "data/llm-benchmaq"]
+	path = data/llm-benchmaq
+	url = https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq.git

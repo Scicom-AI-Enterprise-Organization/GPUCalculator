@@ -39,8 +39,8 @@ const openSans = Open_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "Scicom Design Hub",
-  description: "Scicom Design System - Built with Next.js and shadcn/ui",
+  title: "GPU Calculator - Scicom AI",
+  description: "GPU performance benchmark dashboard and VRAM estimator for LLM inference",
 };
 
 export default function RootLayout({

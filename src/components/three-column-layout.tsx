@@ -281,7 +281,7 @@ export function ThreeColumnLayout({
         </div>
       </div>
 
-      <PageFooter description="Scicom Design Hub - Component Documentation" />
+      <PageFooter />
     </div>
   );
 }

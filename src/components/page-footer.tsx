@@ -2,23 +2,12 @@
 
 import Image from "next/image";
 
-interface PageFooterProps {
-  /** Optional: Custom description text */
-  description?: string;
-}
-
-/**
- * Shared footer component used across all pages.
- * Displays logo, Design Hub label, and credit text.
- */
-export function PageFooter({
-  description = "Built with Next.js, Tailwind CSS, and shadcn/ui.",
-}: PageFooterProps) {
+export function PageFooter() {
   return (
-    <footer className="border-t border-border py-8">
-      <div className="container mx-auto px-4 lg:px-8">
-        <div className="flex flex-col items-center justify-between gap-4 md:flex-row">
-          <div className="flex items-center gap-2">
+    <footer className="border-t border-border bg-muted/30">
+      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <div className="flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
             <Image
               src="/images/scicom-logo.png"
               alt="Scicom"
@@ -26,11 +15,25 @@ export function PageFooter({
               height={32}
               className="h-6 w-auto dark:brightness-0 dark:invert"
             />
-            <span className="text-sm font-medium text-muted-foreground">
-              Design Hub
+            <span className="text-xs text-muted-foreground">
+              AI Enterprise Organization
             </span>
           </div>
-          <p className="text-sm text-muted-foreground">{description}</p>
+
+          <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
+            <a
+              href="https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              Benchmark Repository
+            </a>
+            <span className="hidden sm:inline">&middot;</span>
+            <span>Built with Next.js &amp; Recharts</span>
+            <span className="hidden sm:inline">&middot;</span>
+            <span>Data: vLLM &amp; SGLang benchmarks across B200, H200, H100, A100</span>
+          </div>
         </div>
       </div>
     </footer>
