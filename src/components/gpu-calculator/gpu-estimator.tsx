@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useMemo, useCallback } from "react";
-import { Loader2, CheckCircle2, XCircle, Link as LinkIcon } from "lucide-react";
+import { Loader2, CheckCircle2, XCircle, Link as LinkIcon, Database } from "lucide-react";
+import type { BenchmarkData, BenchmarkPoint } from "@/lib/read-benchmarks";
 
 // vram in GB, tflops = FP16 dense TFLOPS, bw = memory bandwidth in GB/s
 const GPU_SPECS: Record<string, { vram: number; tflops: number; bw: number; label: string }> = {
@@ -54,6 +55,14 @@ interface ModelConfig {
   intermediateSize: number;
   vocabSize: number;
   moe: MoeConfig | null;
+}
+
+interface InterpolatedEstimate {
+  throughputPerGpu: number;
+  ttftMs: number;
+  e2eMs: number;
+  confidence: "interpolated" | "extrapolated" | "nearest";
+  basedOn: string; // description of what data was used
 }
 
 interface EstimationResult {
@@ -247,6 +256,274 @@ function estimateGpus(
   };
 }
 
+// Map estimator GPU keys to benchmark GPU labels
+const GPU_KEY_TO_BENCHMARK: Record<string, string> = {
+  b200: "B200",
+  h200: "H200 SXM",
+  h100: "H100 SXM",
+  a100_80: "A100 SXM",
+  a100_40: "A100 SXM",
+  l40s: "",
+  a10: "",
+  rtx_4090: "",
+};
+
+// Benchmark model metadata: total params, active params, and architecture type
+const BENCHMARK_MODELS: Record<string, { totalB: number; activeB: number; isMoe: boolean; precision?: string }> = {
+  "gpt-oss-120b": { totalB: 120, activeB: 5.1, isMoe: true },
+  "qwen3-32b":    { totalB: 32,  activeB: 32,  isMoe: false },
+  "glm-4.7":      { totalB: 358, activeB: 32,  isMoe: true },
+  "glm-4.7-fp8":  { totalB: 358, activeB: 32,  isMoe: true, precision: "fp8" },
+};
+
+// Linear interpolation
+function lerp(x: number, x0: number, x1: number, y0: number, y1: number): number {
+  if (x1 === x0) return y0;
+  return y0 + (y1 - y0) * ((x - x0) / (x1 - x0));
+}
+
+// Log-linear interpolation (better for throughput/latency scaling)
+function logLerp(x: number, x0: number, x1: number, y0: number, y1: number): number {
+  if (x1 === x0 || y0 <= 0 || y1 <= 0) return lerp(x, x0, x1, y0, y1);
+  const logY = lerp(Math.log(x), Math.log(x0), Math.log(x1), Math.log(y0), Math.log(y1));
+  return Math.exp(logY);
+}
+
+// Interpolate a metric across context lengths for a given set of points (same model+gpu+config)
+function interpolateByCtx(
+  points: BenchmarkPoint[],
+  targetCtx: number,
+  metric: (p: BenchmarkPoint) => number
+): { value: number; confidence: "interpolated" | "extrapolated" | "nearest" } | null {
+  if (points.length === 0) return null;
+
+  const sorted = [...points].sort((a, b) => a.ctx - b.ctx);
+  const ctxValues = sorted.map((p) => p.ctx);
+
+  // Exact match
+  const exact = sorted.find((p) => p.ctx === targetCtx);
+  if (exact) return { value: metric(exact), confidence: "interpolated" };
+
+  // Single point — nearest
+  if (sorted.length === 1) return { value: metric(sorted[0]), confidence: "nearest" };
+
+  // Within range — interpolate
+  if (targetCtx >= ctxValues[0] && targetCtx <= ctxValues[ctxValues.length - 1]) {
+    // Find surrounding points
+    let lo = sorted[0], hi = sorted[1];
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (sorted[i].ctx <= targetCtx && sorted[i + 1].ctx >= targetCtx) {
+        lo = sorted[i];
+        hi = sorted[i + 1];
+        break;
+      }
+    }
+    return {
+      value: logLerp(targetCtx, lo.ctx, hi.ctx, metric(lo), metric(hi)),
+      confidence: "interpolated",
+    };
+  }
+
+  // Outside range — extrapolate from nearest two points
+  const [a, b] = targetCtx < ctxValues[0]
+    ? [sorted[0], sorted[1]]
+    : [sorted[sorted.length - 2], sorted[sorted.length - 1]];
+  return {
+    value: Math.max(0, logLerp(targetCtx, a.ctx, b.ctx, metric(a), metric(b))),
+    confidence: "extrapolated",
+  };
+}
+
+// Interpolate a metric across model sizes
+function interpolateByModelSize(
+  sizeMetricPairs: { size: number; value: number }[],
+  targetSize: number
+): { value: number; confidence: "interpolated" | "extrapolated" | "nearest" } | null {
+  if (sizeMetricPairs.length === 0) return null;
+
+  const sorted = [...sizeMetricPairs].sort((a, b) => a.size - b.size);
+
+  // Exact match
+  const exact = sorted.find((p) => p.size === targetSize);
+  if (exact) return { value: exact.value, confidence: "interpolated" };
+
+  if (sorted.length === 1) return { value: sorted[0].value, confidence: "nearest" };
+
+  // Within range
+  if (targetSize >= sorted[0].size && targetSize <= sorted[sorted.length - 1].size) {
+    let lo = sorted[0], hi = sorted[1];
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (sorted[i].size <= targetSize && sorted[i + 1].size >= targetSize) {
+        lo = sorted[i];
+        hi = sorted[i + 1];
+        break;
+      }
+    }
+    return {
+      value: logLerp(targetSize, lo.size, hi.size, lo.value, hi.value),
+      confidence: "interpolated",
+    };
+  }
+
+  // Extrapolate
+  const [a, b] = targetSize < sorted[0].size
+    ? [sorted[0], sorted[1]]
+    : [sorted[sorted.length - 2], sorted[sorted.length - 1]];
+  return {
+    value: Math.max(0, logLerp(targetSize, a.size, b.size, a.value, b.value)),
+    confidence: "extrapolated",
+  };
+}
+
+function interpolateFromBenchmarks(
+  points: BenchmarkPoint[],
+  gpuKey: string,
+  targetModelSizeB: number,
+  targetCtx: number,
+  targetIsMoe: boolean,
+  targetActiveParamsB: number,
+): InterpolatedEstimate | null {
+  const gpuLabel = GPU_KEY_TO_BENCHMARK[gpuKey];
+  if (!gpuLabel) return null;
+
+  const gpuPoints = points.filter((p) => p.gpu === gpuLabel);
+  if (gpuPoints.length === 0) return null;
+
+  // Group by model
+  const modelGroups = new Map<string, BenchmarkPoint[]>();
+  for (const p of gpuPoints) {
+    const key = p.model;
+    if (!modelGroups.has(key)) modelGroups.set(key, []);
+    modelGroups.get(key)!.push(p);
+  }
+
+  // For each model, interpolate by context length first
+  // Use active params as the interpolation axis — this makes MoE and dense comparable
+  const sizeToThroughput: { size: number; value: number }[] = [];
+  const sizeToTtft: { size: number; value: number }[] = [];
+  const sizeToE2e: { size: number; value: number }[] = [];
+  const usedModels: string[] = [];
+
+  for (const [modelName, modelPoints] of modelGroups) {
+    const meta = BENCHMARK_MODELS[modelName];
+    if (!meta) continue;
+
+    // Filter by architecture: match MoE with MoE, dense with dense
+    // If no same-architecture matches exist, we'll fall back to all models below
+    if (meta.isMoe !== targetIsMoe) continue;
+
+    // Use TP8/DP1 config if available for consistency
+    const tp8Points = modelPoints.filter((p) => p.config === "TP8/DP1");
+    const usePoints = tp8Points.length > 0 ? tp8Points : modelPoints;
+
+    // Deduplicate by ctx (pick best throughput per ctx)
+    const byCtx = new Map<number, BenchmarkPoint>();
+    for (const p of usePoints) {
+      const existing = byCtx.get(p.ctx);
+      if (!existing || p.throughputPerGpu > existing.throughputPerGpu) {
+        byCtx.set(p.ctx, p);
+      }
+    }
+    const dedupedPoints = [...byCtx.values()];
+
+    // Use active params as the size axis for interpolation
+    const interpSize = meta.activeB;
+
+    const throughputResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.throughputPerGpu);
+    const ttftResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.ttft);
+    const e2eResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.e2eLatency * 1000);
+
+    if (throughputResult) sizeToThroughput.push({ size: interpSize, value: throughputResult.value });
+    if (ttftResult) sizeToTtft.push({ size: interpSize, value: ttftResult.value });
+    if (e2eResult) sizeToE2e.push({ size: interpSize, value: e2eResult.value });
+    usedModels.push(`${modelName}(${interpSize}B active)`);
+  }
+
+  // Fall back to all models if no same-architecture matches
+  if (sizeToThroughput.length === 0) {
+    for (const [modelName, modelPoints] of modelGroups) {
+      const meta = BENCHMARK_MODELS[modelName];
+      if (!meta) continue;
+
+      const tp8Points = modelPoints.filter((p) => p.config === "TP8/DP1");
+      const usePoints = tp8Points.length > 0 ? tp8Points : modelPoints;
+
+      const byCtx = new Map<number, BenchmarkPoint>();
+      for (const p of usePoints) {
+        const existing = byCtx.get(p.ctx);
+        if (!existing || p.throughputPerGpu > existing.throughputPerGpu) {
+          byCtx.set(p.ctx, p);
+        }
+      }
+      const dedupedPoints = [...byCtx.values()];
+      const interpSize = meta.activeB;
+
+      const throughputResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.throughputPerGpu);
+      const ttftResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.ttft);
+      const e2eResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.e2eLatency * 1000);
+
+      if (throughputResult) sizeToThroughput.push({ size: interpSize, value: throughputResult.value });
+      if (ttftResult) sizeToTtft.push({ size: interpSize, value: ttftResult.value });
+      if (e2eResult) sizeToE2e.push({ size: interpSize, value: e2eResult.value });
+      usedModels.push(`${modelName}(${interpSize}B active)`);
+    }
+  }
+
+  if (sizeToThroughput.length === 0) return null;
+
+  // Interpolate across active model sizes
+  const targetInterpSize = targetIsMoe ? targetActiveParamsB : targetModelSizeB;
+
+  const throughputEst = interpolateByModelSize(sizeToThroughput, targetInterpSize);
+  const ttftEst = interpolateByModelSize(sizeToTtft, targetInterpSize);
+  const e2eEst = interpolateByModelSize(sizeToE2e, targetInterpSize);
+
+  if (!throughputEst || !ttftEst || !e2eEst) return null;
+
+  const worstConfidence = [throughputEst, ttftEst, e2eEst].some((e) => e.confidence === "extrapolated")
+    ? "extrapolated"
+    : [throughputEst, ttftEst, e2eEst].some((e) => e.confidence === "nearest")
+      ? "nearest"
+      : "interpolated";
+
+  // Build description
+  const archLabel = targetIsMoe ? "MoE" : "dense";
+  const ctxValues = [...new Set(gpuPoints.map((p) => p.ctx))].sort((a, b) => a - b);
+  const basedOn = `${gpuLabel} ${archLabel} data: ${usedModels.join(", ")} at ${ctxValues.map((c) => c >= 1000 ? `${(c / 1000)}K` : c).join(", ")} ctx`;
+
+  return {
+    throughputPerGpu: Math.max(1, Math.round(throughputEst.value)),
+    ttftMs: Math.max(0, ttftEst.value),
+    e2eMs: Math.max(0, e2eEst.value),
+    confidence: worstConfidence,
+    basedOn,
+  };
+}
+
+function findMatchingBenchmarks(
+  points: BenchmarkPoint[],
+  gpuKey: string,
+  inputTokens: number,
+): BenchmarkPoint[] {
+  const gpuLabel = GPU_KEY_TO_BENCHMARK[gpuKey];
+  if (!gpuLabel) return [];
+
+  // Find benchmarks matching the GPU
+  const gpuMatches = points.filter((p) => p.gpu === gpuLabel);
+  if (gpuMatches.length === 0) return [];
+
+  // Find the closest context length available
+  const availableCtx = [...new Set(gpuMatches.map((p) => p.ctx))].sort((a, b) => a - b);
+  const closestCtx = availableCtx.reduce((prev, curr) =>
+    Math.abs(curr - inputTokens) < Math.abs(prev - inputTokens) ? curr : prev
+  );
+
+  // Return all benchmarks at the closest context length for this GPU
+  return gpuMatches
+    .filter((p) => p.ctx === closestCtx)
+    .sort((a, b) => b.throughputPerGpu - a.throughputPerGpu);
+}
+
 function VramBar({ label, value, total, color }: { label: string; value: number; total: number; color: string }) {
   const pct = Math.min((value / total) * 100, 100);
   return (
@@ -275,7 +552,7 @@ function formatLatency(ms: number): string {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
-export function GpuEstimator() {
+export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }) {
   const [paramsB, setParamsB] = useState(70);
   const [quant, setQuant] = useState("bf16");
   const [kvPrecision, setKvPrecision] = useState("bf16");
@@ -348,6 +625,19 @@ export function GpuEstimator() {
   );
 
   const gpu = GPU_SPECS[gpuType];
+
+  const matchingBenchmarks = useMemo(
+    () => findMatchingBenchmarks(benchmarkData.points, gpuType, inputTokens),
+    [benchmarkData.points, gpuType, inputTokens]
+  );
+
+  const interpolated = useMemo(
+    () => interpolateFromBenchmarks(
+      benchmarkData.points, gpuType, paramsB, inputTokens,
+      isMoe, result.activeParamsB
+    ),
+    [benchmarkData.points, gpuType, paramsB, inputTokens, isMoe, result.activeParamsB]
+  );
 
   return (
     <div className="grid gap-6 lg:grid-cols-2">
@@ -663,28 +953,74 @@ export function GpuEstimator() {
         {/* Latency Estimates */}
         <div className="rounded-xl border border-border bg-card p-6">
           <h4 className="mb-3 text-sm font-semibold">Estimated Latency</h4>
-          <div className="grid grid-cols-3 gap-3">
-            <div className="rounded-lg bg-muted/50 p-3">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
-              <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(result.ttftMs)}</div>
-              <div className="mt-0.5 text-[10px] text-muted-foreground">Time to first token</div>
-            </div>
-            <div className="rounded-lg bg-muted/50 p-3">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TPOT</div>
-              <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(result.tpotMs)}</div>
-              <div className="mt-0.5 text-[10px] text-muted-foreground">Per output token</div>
-            </div>
-            <div className="rounded-lg bg-muted/50 p-3">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">E2E</div>
-              <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(result.e2eMs)}</div>
-              <div className="mt-0.5 text-[10px] text-muted-foreground">{inputTokens} in / {outputTokens} out</div>
+
+          {/* Data-interpolated estimate (primary when available) */}
+          {interpolated && (
+            <>
+              <div className="mb-1 flex items-center gap-1.5">
+                <Database className="h-3 w-3 text-primary" />
+                <span className="text-[10px] font-medium text-primary">
+                  Data-driven ({interpolated.confidence})
+                </span>
+              </div>
+              <div className="mb-3 grid grid-cols-3 gap-3">
+                <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
+                  <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(interpolated.ttftMs)}</div>
+                  <div className="mt-0.5 text-[10px] text-muted-foreground">Time to first token</div>
+                </div>
+                <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Throughput</div>
+                  <div className="mt-1 text-lg font-bold text-foreground">{interpolated.throughputPerGpu.toLocaleString()}</div>
+                  <div className="mt-0.5 text-[10px] text-muted-foreground">tok/s/GPU</div>
+                </div>
+                <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">E2E</div>
+                  <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(interpolated.e2eMs)}</div>
+                  <div className="mt-0.5 text-[10px] text-muted-foreground">{inputTokens} in / 128 out</div>
+                </div>
+              </div>
+              <p className="mb-4 text-[10px] text-muted-foreground">
+                {interpolated.confidence === "interpolated"
+                  ? "Interpolated from real benchmark data."
+                  : interpolated.confidence === "extrapolated"
+                    ? "Extrapolated beyond available data range — treat as rough estimate."
+                    : "Based on nearest available data point."}
+                {" "}{interpolated.basedOn}.
+                {" "}100 concurrent requests, 128 output tokens.
+              </p>
+            </>
+          )}
+
+          {/* Theoretical estimate */}
+          <div className={interpolated ? "mt-1" : ""}>
+            {interpolated && (
+              <div className="mb-1 text-[10px] font-medium text-muted-foreground">
+                Theoretical (FLOPS / bandwidth model)
+              </div>
+            )}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="rounded-lg bg-muted/50 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
+                <div className={`mt-1 font-bold text-foreground ${interpolated ? "text-sm" : "text-lg"}`}>{formatLatency(result.ttftMs)}</div>
+                <div className="mt-0.5 text-[10px] text-muted-foreground">Time to first token</div>
+              </div>
+              <div className="rounded-lg bg-muted/50 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TPOT</div>
+                <div className={`mt-1 font-bold text-foreground ${interpolated ? "text-sm" : "text-lg"}`}>{formatLatency(result.tpotMs)}</div>
+                <div className="mt-0.5 text-[10px] text-muted-foreground">Per output token</div>
+              </div>
+              <div className="rounded-lg bg-muted/50 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">E2E</div>
+                <div className={`mt-1 font-bold text-foreground ${interpolated ? "text-sm" : "text-lg"}`}>{formatLatency(result.e2eMs)}</div>
+                <div className="mt-0.5 text-[10px] text-muted-foreground">{inputTokens} in / {outputTokens} out</div>
+              </div>
             </div>
           </div>
           <p className="mt-3 text-[10px] text-muted-foreground">
-            Single request estimate. Prefill is compute-bound (~35% utilization of {gpu.tflops} TFLOPS).
-            Decode is memory-bandwidth-bound (~65% utilization of {gpu.bw} GB/s).
+            {interpolated ? "Theoretical: " : ""}Single request estimate. Prefill is compute-bound (~35% of {gpu.tflops} TFLOPS).
+            Decode is memory-bandwidth-bound (~65% of {gpu.bw} GB/s).
             {isMoe && ` MoE decode reads only active weights (~${result.activeParamsB.toFixed(1)}B).`}
-            {" "}Actual latency varies with batching, framework, and hardware thermals.
           </p>
         </div>
 
@@ -780,6 +1116,58 @@ export function GpuEstimator() {
               <span>{(result.activeParamsB * PRECISION[quant].bytesPerParam).toFixed(1)} GB / ({result.numGpus} &times; {gpu.bw} GB/s &times; 65%)</span>
             </div>
           </div>
+        </div>
+
+        {/* Real Benchmark Reference */}
+        <div className="rounded-xl border border-border bg-card p-6">
+          <h4 className="mb-1 flex items-center gap-1.5 text-sm font-semibold">
+            <Database className="h-3.5 w-3.5" />
+            Real Benchmark Reference
+          </h4>
+          {matchingBenchmarks.length > 0 ? (
+            <>
+              <p className="mb-3 text-[10px] text-muted-foreground">
+                Actual results on {GPU_KEY_TO_BENCHMARK[gpuType]} at {matchingBenchmarks[0].ctx.toLocaleString()} input tokens
+                (closest to your {inputTokens.toLocaleString()}).
+                8 GPUs, {matchingBenchmarks[0].concurrency} concurrent, {matchingBenchmarks[0].numPrompts} prompts, 128 output tokens.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-border text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                      <th className="pb-2 pr-3 font-medium">Model</th>
+                      <th className="pb-2 pr-3 font-medium">Engine</th>
+                      <th className="pb-2 pr-3 font-medium">Config</th>
+                      <th className="pb-2 pr-3 text-right font-medium">Throughput/GPU</th>
+                      <th className="pb-2 pr-3 text-right font-medium">TTFT</th>
+                      <th className="pb-2 text-right font-medium">E2E Latency</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {matchingBenchmarks.map((b, i) => (
+                      <tr key={i} className="border-b border-border/50 last:border-0">
+                        <td className="py-1.5 pr-3 font-medium text-foreground">{b.model}</td>
+                        <td className="py-1.5 pr-3">{b.engine}</td>
+                        <td className="py-1.5 pr-3">{b.config}</td>
+                        <td className="py-1.5 pr-3 text-right font-medium text-foreground">{b.throughputPerGpu.toLocaleString()} tok/s</td>
+                        <td className="py-1.5 pr-3 text-right">{b.ttft.toFixed(0)} ms</td>
+                        <td className="py-1.5 text-right">{b.e2eLatency < 1 ? `${(b.e2eLatency * 1000).toFixed(0)} ms` : `${b.e2eLatency.toFixed(2)} s`}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {matchingBenchmarks[0].ctx !== inputTokens && (
+                <p className="mt-2 text-[10px] text-muted-foreground">
+                  Note: Closest available context length is {matchingBenchmarks[0].ctx.toLocaleString()} (you selected {inputTokens.toLocaleString()}).
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="mt-2 text-xs text-muted-foreground">
+              No benchmark data available for {gpu.label}. Real benchmarks are available for B200, H200 SXM, H100 SXM, and A100 SXM.
+            </p>
+          )}
         </div>
       </div>
     </div>

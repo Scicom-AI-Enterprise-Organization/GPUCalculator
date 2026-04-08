@@ -2,13 +2,13 @@
 
 LLM inference benchmark dashboard and GPU estimator.
 
-## Benchmark Results
+## Benchmark Results (`/`)
 
 Interactive scatter plot of Token Throughput per GPU vs End-to-End Latency. Filter by GPU type, model, inference engine (vLLM / SGLang), and parallelism config.
 
 ![Benchmark Results](benchmark-results.png)
 
-## GPU Estimator
+## GPU Estimator (`/gpu-estimator`)
 
 Estimate GPU count, VRAM usage, and latency for LLM inference.
 
@@ -30,11 +30,15 @@ Estimate GPU count, VRAM usage, and latency for LLM inference.
 
 - Estimated GPU count (rounded to power of 2 for tensor parallelism)
 - TP/DP parallelism recommendation
-- **Latency estimates** — TTFT (prefill, compute-bound), TPOT (decode, memory-bandwidth-bound), and E2E latency for a single request
 - VRAM breakdown: model weights, KV cache, activation overhead
-- Full calculation reference with formulas
 
-### Latency Model
+### Latency Estimation
+
+Two approaches shown side by side:
+
+**Data-driven (interpolated)** — Log-linear interpolation from real benchmark data, separated by architecture type (MoE vs dense). Uses active parameters as the interpolation axis. Available for B200, H200 SXM, H100 SXM, and A100 SXM.
+
+**Theoretical (FLOPS / bandwidth)** — Fallback for GPUs without benchmark data.
 
 | Phase | Bound by | Formula |
 |-------|----------|---------|
@@ -42,7 +46,14 @@ Estimate GPU count, VRAM usage, and latency for LLM inference.
 | TPOT (decode) | Memory BW | `active_model_bytes / (num_gpus * bandwidth * 65%)` |
 | E2E | Both | `TTFT + output_tokens * TPOT` |
 
-For MoE models, decode reads only active expert weights, reducing TPOT. Utilization factors are conservative single-request estimates — actual throughput improves with batching.
+### Benchmark Models
+
+| Model | Type | Total Params | Active Params |
+|-------|------|-------------|---------------|
+| GPT-OSS-120B | MoE | 120B | 5.1B |
+| GLM-4.7 | MoE | 358B | 32B |
+| GLM-4.7-FP8 | MoE | 358B | 32B |
+| Qwen3-32B | Dense | 32B | 32B |
 
 ## Benchmark Data
 

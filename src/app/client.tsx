@@ -1,22 +1,18 @@
 "use client";
 
-import { useState } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { Cpu, BarChart3 } from "lucide-react";
-import { BenchmarkChart } from "@/components/gpu-calculator/benchmark-chart";
-import { GpuEstimator } from "@/components/gpu-calculator/gpu-estimator";
-import type { BenchmarkData } from "@/lib/read-benchmarks";
 import { PageHeader } from "@/components/page-header";
 import { PageFooter } from "@/components/page-footer";
 
 const tabs = [
-  { id: "benchmark", label: "Benchmark Results", icon: BarChart3 },
-  { id: "estimator", label: "GPU Estimator", icon: Cpu },
+  { id: "/", label: "Benchmark Results", icon: BarChart3 },
+  { id: "/gpu-estimator", label: "GPU Estimator", icon: Cpu },
 ] as const;
 
-type Tab = (typeof tabs)[number]["id"];
-
-export function GpuCalculatorClient({ data }: { data: BenchmarkData }) {
-  const [activeTab, setActiveTab] = useState<Tab>("benchmark");
+export function GpuCalculatorShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
 
   return (
     <div className="flex min-h-screen flex-col bg-background">
@@ -36,31 +32,28 @@ export function GpuCalculatorClient({ data }: { data: BenchmarkData }) {
           <div className="mb-6 flex gap-0 rounded-lg border border-border bg-muted/30 p-1">
             {tabs.map((tab, i) => {
               const Icon = tab.icon;
+              const isActive = pathname === tab.id;
               return (
-                <button
+                <Link
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
+                  href={tab.id}
                   className={`flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-colors ${
                     i > 0 ? "border-l border-border" : ""
                   } ${
-                    activeTab === tab.id
+                    isActive
                       ? "bg-background text-foreground shadow-sm"
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
                   <Icon className="h-4 w-4" />
                   {tab.label}
-                </button>
+                </Link>
               );
             })}
           </div>
 
           {/* Content */}
-          {activeTab === "benchmark" ? (
-            <BenchmarkChart data={data} />
-          ) : (
-            <GpuEstimator />
-          )}
+          {children}
         </div>
       </main>
 
