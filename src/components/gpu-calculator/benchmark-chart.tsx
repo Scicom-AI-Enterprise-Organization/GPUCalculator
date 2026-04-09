@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import {
   ScatterChart,
   Scatter,
@@ -19,8 +19,14 @@ import type { BenchmarkData, BenchmarkPoint } from "@/lib/read-benchmarks";
 const MODEL_COLORS: Record<string, string> = {
   "gpt-oss-120b": "#f97316",
   "qwen3-32b": "#22c55e",
+  "qwen3-14b": "#16a34a",
+  "qwen3-8b": "#4ade80",
+  "qwen3.5-122b": "#059669",
+  "qwen3.5-35b": "#34d399",
+  "qwen3.5-27b": "#6ee7b7",
   "glm-4.7": "#0891b2",
   "glm-4.7-fp8": "#8b5cf6",
+  "llama3.1-70b": "#ef4444",
 };
 
 const GPU_SHAPES: Record<string, string> = {
@@ -97,6 +103,11 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
   const [modelFilter, setModelFilter] = useState("All");
   const [engineFilter, setEngineFilter] = useState("All");
   const [configFilter, setConfigFilter] = useState("All");
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   const filteredPoints = useMemo(() => {
     return data.points.filter((p) => {
@@ -125,7 +136,7 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
   const seriesEntries = useMemo(() => [...series.entries()], [series]);
 
   return (
-    <div>
+    <div className="min-w-0">
       {/* Filters */}
       <div className="mb-6 flex flex-wrap gap-4">
         <FilterSelect label="GPU Type" value={gpuFilter} options={data.gpus} onChange={setGpuFilter} />
@@ -135,25 +146,27 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
       </div>
 
       {/* Chart */}
-      <div className="rounded-xl border border-border bg-card p-4">
-        <h3 className="mb-1 text-base font-semibold">Token Throughput per GPU vs End-to-End Latency</h3>
+      <div className="rounded-xl border border-border bg-card p-2 sm:p-4">
+        <h3 className="mb-1 text-sm font-semibold sm:text-base">Token Throughput per GPU vs End-to-End Latency</h3>
         <p className="mb-4 text-xs text-muted-foreground">
           8 GPUs &middot; 100 concurrent requests &middot; 128 output tokens &middot; Points labeled with context length
         </p>
-        <ResponsiveContainer width="100%" height={500}>
-          <ScatterChart margin={{ top: 20, right: 30, bottom: 20, left: 20 }}>
+        <div className="h-[350px] w-full min-w-0 sm:h-[500px]">
+        {mounted ? (
+        <ResponsiveContainer width="100%" height="100%">
+          <ScatterChart margin={{ top: 10, right: 10, bottom: 20, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" className="opacity-30" />
             <XAxis
               type="number"
               dataKey="throughputPerGpu"
               name="Throughput/GPU"
               unit=" tok/s"
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 10 }}
               label={{
-                value: "Token Throughput per GPU (tok/s)",
+                value: "Throughput/GPU (tok/s)",
                 position: "bottom",
                 offset: 0,
-                style: { fontSize: 12 },
+                style: { fontSize: 10 },
               }}
             />
             <YAxis
@@ -161,24 +174,25 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
               dataKey="e2eLatency"
               name="E2E Latency"
               unit="s"
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 10 }}
               label={{
-                value: "End-to-End Latency (s)",
+                value: "E2E Latency (s)",
                 angle: -90,
                 position: "insideLeft",
                 offset: 10,
-                style: { fontSize: 12 },
+                style: { fontSize: 10 },
               }}
+              width={50}
             />
             <ZAxis range={[20, 20]} />
             <Tooltip content={<CustomTooltip />} />
             <Legend
-              wrapperStyle={{ fontSize: 11, paddingTop: 16 }}
+              wrapperStyle={{ fontSize: 10, paddingTop: 8, lineHeight: "1.6" }}
             />
             {seriesEntries.map(([key, pts]) => {
               const sample = pts[0];
               const color = getColor(sample.model);
-              const label = `${sample.engine} ${sample.gpu} ${sample.model} ${sample.config}`;
+              const label = `${sample.model} (${sample.engine}, ${sample.config})`;
               return (
                 <Scatter
                   key={key}
@@ -206,6 +220,12 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
             })}
           </ScatterChart>
         </ResponsiveContainer>
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            Loading chart…
+          </div>
+        )}
+        </div>
       </div>
 
       {/* Summary stats */}

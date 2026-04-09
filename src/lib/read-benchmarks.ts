@@ -34,6 +34,15 @@ const GPU_LABEL_MAP: Record<string, string> = {
   runpod_a100sxm: "A100 SXM",
 };
 
+const MODEL_NAME_MAP: Record<string, string> = {
+  "llama-3.1-70b": "llama3.1-70b",
+};
+
+function normalizeModel(dir: string): string {
+  const lower = dir.toLowerCase();
+  return MODEL_NAME_MAP[lower] || lower;
+}
+
 const NUM_GPUS = 8;
 
 function parseVllmFile(filePath: string, gpuDir: string, modelDir: string): BenchmarkPoint | null {
@@ -53,7 +62,7 @@ function parseVllmFile(filePath: string, gpuDir: string, modelDir: string): Benc
     return {
       engine: "vLLM",
       gpu,
-      model: modelDir.toLowerCase(),
+      model: normalizeModel(modelDir),
       tp,
       dp,
       config: `TP${tp}/DP${dp}`,
@@ -76,7 +85,7 @@ function parseSglangTxt(filePath: string, gpuDir: string, modelDir: string): Ben
     const raw = fs.readFileSync(filePath, "utf-8");
 
     const fileName = path.basename(filePath, ".txt");
-    const match = fileName.match(/\w+_tp(\d+)_dp(\d+)_in(\d+)_out(\d+)_p(\d+)_c(\d+)/i);
+    const match = fileName.match(/tp(\d+)_dp(\d+).*?_in(\d+)_out(\d+)_p(\d+)_c(\d+)/i);
     if (!match) return null;
 
     const tp = parseInt(match[1]);
@@ -98,7 +107,7 @@ function parseSglangTxt(filePath: string, gpuDir: string, modelDir: string): Ben
     return {
       engine: "SGLang",
       gpu,
-      model: modelDir.toLowerCase(),
+      model: normalizeModel(modelDir),
       tp,
       dp,
       config: `TP${tp}/DP${dp}`,
@@ -120,23 +129,27 @@ export async function readBenchmarkData(): Promise<BenchmarkData> {
   const benchmarksDir = path.join(process.cwd(), "data", "llm-benchmaq", "benchmarks");
   const points: BenchmarkPoint[] = [];
 
-  // Process vLLM benchmarks (runpod_*)
-  const vllmDirs = ["runpod_b200", "runpod_h100sxm", "runpod_h200sxm"];
-  for (const gpuDir of vllmDirs) {
-    const gpuPath = path.join(benchmarksDir, gpuDir);
-    if (!fs.existsSync(gpuPath)) continue;
-
-    const models = fs.readdirSync(gpuPath).filter((f) =>
-      fs.statSync(path.join(gpuPath, f)).isDirectory()
+  // Process vLLM benchmarks (vllm/<gpu>/<model>/)
+  const vllmDir = path.join(benchmarksDir, "vllm");
+  if (fs.existsSync(vllmDir)) {
+    const gpuDirs = fs.readdirSync(vllmDir).filter((f) =>
+      fs.statSync(path.join(vllmDir, f)).isDirectory()
     );
 
-    for (const modelDir of models) {
-      const modelPath = path.join(gpuPath, modelDir);
-      const files = fs.readdirSync(modelPath).filter((f) => f.endsWith(".json"));
+    for (const gpuDir of gpuDirs) {
+      const gpuPath = path.join(vllmDir, gpuDir);
+      const models = fs.readdirSync(gpuPath).filter((f) =>
+        fs.statSync(path.join(gpuPath, f)).isDirectory()
+      );
 
-      for (const file of files) {
-        const point = parseVllmFile(path.join(modelPath, file), gpuDir, modelDir);
-        if (point) points.push(point);
+      for (const modelDir of models) {
+        const modelPath = path.join(gpuPath, modelDir);
+        const files = fs.readdirSync(modelPath).filter((f) => f.endsWith(".json"));
+
+        for (const file of files) {
+          const point = parseVllmFile(path.join(modelPath, file), gpuDir, modelDir);
+          if (point) points.push(point);
+        }
       }
     }
   }

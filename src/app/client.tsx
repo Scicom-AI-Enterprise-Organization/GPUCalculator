@@ -15,7 +15,7 @@ export function GpuCalculatorShell({ children }: { children: React.ReactNode }) 
   const pathname = usePathname();
 
   return (
-    <div className="flex min-h-screen flex-col bg-background">
+    <div className="flex min-h-screen flex-col overflow-x-hidden bg-background">
       <PageHeader />
 
       <main className="flex-1 px-4 py-8 sm:px-6 lg:px-8">

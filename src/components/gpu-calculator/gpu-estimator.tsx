@@ -270,10 +270,16 @@ const GPU_KEY_TO_BENCHMARK: Record<string, string> = {
 
 // Benchmark model metadata: total params, active params, and architecture type
 const BENCHMARK_MODELS: Record<string, { totalB: number; activeB: number; isMoe: boolean; precision?: string }> = {
-  "gpt-oss-120b": { totalB: 120, activeB: 5.1, isMoe: true },
-  "qwen3-32b":    { totalB: 32,  activeB: 32,  isMoe: false },
-  "glm-4.7":      { totalB: 358, activeB: 32,  isMoe: true },
-  "glm-4.7-fp8":  { totalB: 358, activeB: 32,  isMoe: true, precision: "fp8" },
+  "gpt-oss-120b":   { totalB: 120, activeB: 5.1, isMoe: true },
+  "qwen3-32b":      { totalB: 32,  activeB: 32,  isMoe: false },
+  "qwen3-14b":      { totalB: 14,  activeB: 14,  isMoe: false },
+  "qwen3-8b":       { totalB: 8,   activeB: 8,   isMoe: false },
+  "qwen3.5-27b":    { totalB: 27,  activeB: 27,  isMoe: false },
+  "qwen3.5-35b":    { totalB: 35,  activeB: 3,   isMoe: true },
+  "qwen3.5-122b":   { totalB: 122, activeB: 10,  isMoe: true },
+  "llama3.1-70b":   { totalB: 70,  activeB: 70,  isMoe: false },
+  "glm-4.7":        { totalB: 358, activeB: 32,  isMoe: true },
+  "glm-4.7-fp8":    { totalB: 358, activeB: 32,  isMoe: true, precision: "fp8" },
 };
 
 // Linear interpolation
@@ -527,9 +533,9 @@ function findMatchingBenchmarks(
 function VramBar({ label, value, total, color }: { label: string; value: number; total: number; color: string }) {
   const pct = Math.min((value / total) * 100, 100);
   return (
-    <div className="flex items-center gap-3">
-      <div className="w-28 text-xs text-muted-foreground">{label}</div>
-      <div className="flex flex-1 items-center gap-2">
+    <div className="flex items-center gap-2 sm:gap-3">
+      <div className="w-24 shrink-0 text-xs text-muted-foreground sm:w-28">{label}</div>
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <div className="flex-1">
           <div className="h-5 w-full rounded-full bg-muted">
             <div
@@ -640,9 +646,9 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
   );
 
   return (
-    <div className="grid gap-6 lg:grid-cols-2">
+    <div className="grid min-w-0 gap-6 lg:grid-cols-2">
       {/* Input Panel */}
-      <div className="rounded-xl border border-border bg-card p-6">
+      <div className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-6">
         <h3 className="mb-4 text-base font-semibold">Configuration</h3>
         <div className="space-y-5">
           {/* HuggingFace Config URL */}
@@ -942,16 +948,16 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
       </div>
 
       {/* Results Panel */}
-      <div className="space-y-4">
+      <div className="min-w-0 space-y-4">
         {/* GPU Count Result */}
-        <div className="rounded-xl border-2 border-primary/30 bg-primary/5 p-6">
+        <div className="rounded-xl border-2 border-primary/30 bg-primary/5 p-4 sm:p-6">
           <div className="text-sm text-muted-foreground">Estimated GPUs Required</div>
           <div className="mt-1 text-5xl font-bold text-primary">{result.numGpus}</div>
           <div className="mt-2 text-sm text-muted-foreground">{result.tpRecommendation}</div>
         </div>
 
         {/* Latency Estimates */}
-        <div className="rounded-xl border border-border bg-card p-6">
+        <div className="rounded-xl border border-border bg-card p-4 sm:p-6">
           <h4 className="mb-3 text-sm font-semibold">Estimated Latency</h4>
 
           {/* Data-interpolated estimate (primary when available) */}
@@ -963,7 +969,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                   Data-driven ({interpolated.confidence})
                 </span>
               </div>
-              <div className="mb-3 grid grid-cols-3 gap-3">
+              <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
                   <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(interpolated.ttftMs)}</div>
@@ -999,7 +1005,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                 Theoretical (FLOPS / bandwidth model)
               </div>
             )}
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <div className="rounded-lg bg-muted/50 p-3">
                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground">TTFT</div>
                 <div className={`mt-1 font-bold text-foreground ${interpolated ? "text-sm" : "text-lg"}`}>{formatLatency(result.ttftMs)}</div>
@@ -1025,7 +1031,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
         </div>
 
         {/* VRAM Breakdown */}
-        <div className="rounded-xl border border-border bg-card p-6">
+        <div className="rounded-xl border border-border bg-card p-4 sm:p-6">
           <h4 className="mb-3 text-sm font-semibold">VRAM Breakdown</h4>
           <div className="space-y-3">
             <VramBar
@@ -1064,7 +1070,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
         </div>
 
         {/* Quick Reference */}
-        <div className="rounded-xl border border-border bg-card p-6">
+        <div className="overflow-hidden rounded-xl border border-border bg-card p-4 sm:p-6">
           <h4 className="mb-3 text-sm font-semibold">
             Quick Reference
             {result.usingHfConfig && (
@@ -1074,52 +1080,52 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
             )}
           </h4>
           <div className="space-y-2 text-xs text-muted-foreground">
-            <div className="flex justify-between">
+            <div className="flex flex-wrap justify-between gap-x-4">
               <span>Model weights</span>
-              <span>{paramsB}B &times; {PRECISION[quant].bytesPerParam} bytes/param = {result.modelVram.toFixed(1)} GB</span>
+              <span className="text-right">{paramsB}B &times; {PRECISION[quant].bytesPerParam} bytes/param = {result.modelVram.toFixed(1)} GB</span>
             </div>
             {result.isMoe && (
-              <div className="flex justify-between">
+              <div className="flex flex-wrap justify-between gap-x-4">
                 <span>Active params (MoE)</span>
-                <span>
+                <span className="text-right">
                   ~{result.activeParamsB.toFixed(1)}B of {paramsB}B
                   ({moeActiveExperts}{moeSharedExperts > 0 ? `+${moeSharedExperts}` : ""}/{moeNumExperts} experts)
                 </span>
               </div>
             )}
-            <div className="flex justify-between">
+            <div className="flex flex-wrap justify-between gap-x-4">
               <span>KV cache per token</span>
-              <span>
+              <span className="text-right">
                 {result.usingHfConfig && hfConfig
                   ? `2 x ${hfConfig.numLayers}L x ${hfConfig.numKvHeads}KV x ${hfConfig.headDim}d x ${KV_PRECISION[kvPrecision].bytes}B = ${(result.kvPerTokenBytes / 1024).toFixed(1)} KB`
                   : `~${(result.kvPerTokenBytes / 1024).toFixed(1)} KB (estimated)`}
               </span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex flex-wrap justify-between gap-x-4">
               <span>KV cache total</span>
-              <span>
+              <span className="text-right">
                 {(result.kvPerTokenBytes / 1024).toFixed(1)} KB &times; {contextLength.toLocaleString()} tokens &times; {concurrentRequests} req = {result.kvCacheVram.toFixed(1)} GB
               </span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex flex-wrap justify-between gap-x-4">
               <span>Framework overhead</span>
-              <span>
+              <span className="text-right">
                 ~10% of {result.isMoe ? `${result.activeParamsB.toFixed(1)}B active` : "model"} = {result.overheadVram.toFixed(1)} GB
               </span>
             </div>
-            <div className="mt-1 border-t border-border pt-2 flex justify-between">
+            <div className="mt-1 flex flex-wrap justify-between gap-x-4 border-t border-border pt-2">
               <span>TTFT</span>
-              <span>2 &times; {result.activeParamsB.toFixed(1)}B &times; {inputTokens.toLocaleString()} tokens / ({result.numGpus} &times; {gpu.tflops} TFLOPS &times; 35%)</span>
+              <span className="text-right">2 &times; {result.activeParamsB.toFixed(1)}B &times; {inputTokens.toLocaleString()} tokens / ({result.numGpus} &times; {gpu.tflops} TFLOPS &times; 35%)</span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex flex-wrap justify-between gap-x-4">
               <span>TPOT</span>
-              <span>{(result.activeParamsB * PRECISION[quant].bytesPerParam).toFixed(1)} GB / ({result.numGpus} &times; {gpu.bw} GB/s &times; 65%)</span>
+              <span className="text-right">{(result.activeParamsB * PRECISION[quant].bytesPerParam).toFixed(1)} GB / ({result.numGpus} &times; {gpu.bw} GB/s &times; 65%)</span>
             </div>
           </div>
         </div>
 
         {/* Real Benchmark Reference */}
-        <div className="rounded-xl border border-border bg-card p-6">
+        <div className="rounded-xl border border-border bg-card p-4 sm:p-6">
           <h4 className="mb-1 flex items-center gap-1.5 text-sm font-semibold">
             <Database className="h-3.5 w-3.5" />
             Real Benchmark Reference
@@ -1131,16 +1137,16 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                 (closest to your {inputTokens.toLocaleString()}).
                 8 GPUs, {matchingBenchmarks[0].concurrency} concurrent, {matchingBenchmarks[0].numPrompts} prompts, 128 output tokens.
               </p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
+              <div className="-mx-4 overflow-x-auto px-4 sm:-mx-6 sm:px-6">
+                <table className="w-full min-w-[480px] text-xs">
                   <thead>
                     <tr className="border-b border-border text-left text-[10px] uppercase tracking-wider text-muted-foreground">
                       <th className="pb-2 pr-3 font-medium">Model</th>
                       <th className="pb-2 pr-3 font-medium">Engine</th>
                       <th className="pb-2 pr-3 font-medium">Config</th>
-                      <th className="pb-2 pr-3 text-right font-medium">Throughput/GPU</th>
+                      <th className="whitespace-nowrap pb-2 pr-3 text-right font-medium">Thpt/GPU</th>
                       <th className="pb-2 pr-3 text-right font-medium">TTFT</th>
-                      <th className="pb-2 text-right font-medium">E2E Latency</th>
+                      <th className="whitespace-nowrap pb-2 text-right font-medium">E2E</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1149,9 +1155,9 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                         <td className="py-1.5 pr-3 font-medium text-foreground">{b.model}</td>
                         <td className="py-1.5 pr-3">{b.engine}</td>
                         <td className="py-1.5 pr-3">{b.config}</td>
-                        <td className="py-1.5 pr-3 text-right font-medium text-foreground">{b.throughputPerGpu.toLocaleString()} tok/s</td>
-                        <td className="py-1.5 pr-3 text-right">{b.ttft.toFixed(0)} ms</td>
-                        <td className="py-1.5 text-right">{b.e2eLatency < 1 ? `${(b.e2eLatency * 1000).toFixed(0)} ms` : `${b.e2eLatency.toFixed(2)} s`}</td>
+                        <td className="whitespace-nowrap py-1.5 pr-3 text-right font-medium text-foreground">{b.throughputPerGpu.toLocaleString()} tok/s</td>
+                        <td className="whitespace-nowrap py-1.5 pr-3 text-right">{b.ttft.toFixed(0)} ms</td>
+                        <td className="whitespace-nowrap py-1.5 text-right">{b.e2eLatency < 1 ? `${(b.e2eLatency * 1000).toFixed(0)} ms` : `${b.e2eLatency.toFixed(2)} s`}</td>
                       </tr>
                     ))}
                   </tbody>
