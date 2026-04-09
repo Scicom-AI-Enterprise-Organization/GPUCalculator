@@ -29,15 +29,23 @@ const KV_PRECISION: Record<string, { bytes: number; label: string }> = {
   fp8:  { bytes: 1, label: "FP8" },
 };
 
-const CONTEXT_OPTIONS = [
-  { value: 2048, label: "2K" },
-  { value: 4096, label: "4K" },
-  { value: 8192, label: "8K" },
-  { value: 16384, label: "16K" },
-  { value: 32768, label: "32K" },
-  { value: 65536, label: "64K" },
-  { value: 131072, label: "128K" },
-];
+// Log-scale context length: slider 0–100 maps to 1024–131072
+const CTX_MIN = 1024;
+const CTX_MAX = 131072;
+const CTX_LOG_MIN = Math.log2(CTX_MIN);
+const CTX_LOG_MAX = Math.log2(CTX_MAX);
+function ctxSliderToValue(slider: number): number {
+  const log = CTX_LOG_MIN + (slider / 100) * (CTX_LOG_MAX - CTX_LOG_MIN);
+  return Math.round(Math.pow(2, log));
+}
+function ctxValueToSlider(value: number): number {
+  const log = Math.log2(Math.max(CTX_MIN, Math.min(CTX_MAX, value)));
+  return Math.round(((log - CTX_LOG_MIN) / (CTX_LOG_MAX - CTX_LOG_MIN)) * 100);
+}
+function formatCtx(value: number): string {
+  if (value >= 1024) return `${(value / 1024).toFixed(value % 1024 === 0 ? 0 : 1)}K`;
+  return String(value);
+}
 
 interface MoeConfig {
   numExperts: number;
@@ -256,24 +264,37 @@ function estimateGpus(
   const utilizationPercent = (totalVram / gpu.vram) * 100;
 
   // --- Latency estimation ---
+  // All estimates are for a single request under concurrent load
 
   // TTFT (prefill phase — compute bound)
-  // FLOPs per token ≈ 2 * active_params (forward pass matmuls)
-  // Total prefill FLOPs = 2 * active_params * input_tokens
-  // GPU compute utilization ~30-50% in practice (TP overhead, attention, etc.)
+  // FLOPs per token ≈ 2 * active_params (linear layers) + 2 * n_layers * seq_len * hidden_size (attention)
+  // Simplified: attention FLOPs scale quadratically with input length
   const prefillUtilization = 0.35;
-  const prefillFlops = 2 * activeParamsB * 1e9 * inputTokens;
-  const totalComputeFlops = numGpus * gpu.tflops * 1e12 * prefillUtilization;
-  const ttftMs = (prefillFlops / totalComputeFlops) * 1000;
+  const linearFlops = 2 * activeParamsB * 1e9 * inputTokens;
+  // Attention FLOPs: 2 * num_layers * input_tokens^2 * hidden_size (Q*K + attn*V)
+  const numLayers = hfConfig ? hfConfig.numLayers : Math.round(paramsB * 0.6); // rough estimate
+  const hiddenSize = hfConfig ? hfConfig.hiddenSize : Math.round(Math.sqrt(paramsB * 1e9 / numLayers / 12));
+  const attentionFlops = 2 * numLayers * inputTokens * inputTokens * hiddenSize;
+  const prefillFlops = linearFlops + attentionFlops;
+  // With TP, only TP GPUs in one shard do compute; DP doesn't help single-request latency
+  const tpComputeFlops = bestTp * gpu.tflops * 1e12 * prefillUtilization;
+  // Under concurrent load, prefill requests share compute; effective throughput is divided
+  const concurrentPrefillFactor = 1 + Math.log2(Math.max(1, concurrentRequests / bestDp));
+  const ttftMs = (prefillFlops / tpComputeFlops) * concurrentPrefillFactor * 1000;
 
   // TPOT (decode phase — memory bandwidth bound)
-  // Each decode step reads model weights from HBM
-  // For MoE, only active expert weights are read per token
+  // Each decode step reads: model weights + KV cache for current sequence
   const activeModelBytes = activeParamsB * q.bytesPerParam * 1e9;
-  const totalBandwidth = numGpus * gpu.bw * 1e9; // bytes/s
-  // Decode utilization is higher (~60-70%) since it's a simpler memory-bound operation
+  // KV cache bytes read per decode step grows with sequence length (input + generated so far)
+  // Average sequence position during decode ≈ inputTokens + outputTokens/2
+  const avgSeqLen = inputTokens + outputTokens / 2;
+  const kvReadBytes = kvPerTokenBytes * avgSeqLen;
+  const totalReadPerStep = activeModelBytes / bestTp + kvReadBytes;
+  const tpBandwidth = bestTp * gpu.bw * 1e9; // bytes/s
   const decodeUtilization = 0.65;
-  const tpotMs = (activeModelBytes / (totalBandwidth * decodeUtilization)) * 1000;
+  // Under concurrent load, bandwidth is shared across concurrent decodes in the DP shard
+  const concurrentDecodeFactor = Math.max(1, concurrentRequests / bestDp);
+  const tpotMs = (totalReadPerStep / (tpBandwidth * decodeUtilization)) * concurrentDecodeFactor * 1000;
 
   // E2E latency for a single request
   const e2eMs = ttftMs + outputTokens * tpotMs;
@@ -608,8 +629,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
   const [contextLength, setContextLength] = useState(8192);
   const [gpuType, setGpuType] = useState("h100");
   const [concurrentRequests, setConcurrentRequests] = useState(10);
-  const [inputTokens, setInputTokens] = useState(1024);
-  const [outputTokens, setOutputTokens] = useState(128);
+  const OUTPUT_TOKENS = 128;
 
   // MoE settings
   const [isMoe, setIsMoe] = useState(false);
@@ -665,27 +685,27 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
     () =>
       estimateGpus(
         paramsB, quant, kvPrecision, contextLength, gpuType,
-        concurrentRequests, inputTokens, outputTokens, hfConfig,
+        concurrentRequests, contextLength, OUTPUT_TOKENS, hfConfig,
         isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts
       ),
     [paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests,
-     inputTokens, outputTokens, hfConfig,
+     OUTPUT_TOKENS, hfConfig,
      isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts]
   );
 
   const gpu = GPU_SPECS[gpuType];
 
   const matchingBenchmarks = useMemo(
-    () => findMatchingBenchmarks(benchmarkData.points, gpuType, inputTokens),
-    [benchmarkData.points, gpuType, inputTokens]
+    () => findMatchingBenchmarks(benchmarkData.points, gpuType, contextLength),
+    [benchmarkData.points, gpuType, contextLength]
   );
 
   const interpolated = useMemo(
     () => interpolateFromBenchmarks(
-      benchmarkData.points, gpuType, paramsB, inputTokens,
+      benchmarkData.points, gpuType, paramsB, contextLength,
       isMoe, result.activeParamsB
     ),
-    [benchmarkData.points, gpuType, paramsB, inputTokens, isMoe, result.activeParamsB]
+    [benchmarkData.points, gpuType, paramsB, contextLength, isMoe, result.activeParamsB]
   );
 
   return (
@@ -903,50 +923,24 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
 
           {/* Context Length */}
           <div>
-            <label className="mb-1.5 block text-sm font-medium">Context Length</label>
-            <div className="flex flex-wrap gap-2">
-              {CONTEXT_OPTIONS.map((opt) => (
-                <button
-                  key={opt.value}
-                  onClick={() => setContextLength(opt.value)}
-                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                    contextLength === opt.value
-                      ? "border-primary bg-primary/10 text-primary"
-                      : "border-border bg-background text-muted-foreground hover:border-primary/50"
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Input / Output Tokens */}
-          <div>
-            <label className="mb-1.5 block text-sm font-medium">Request Shape</label>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="mb-1 block text-[11px] text-muted-foreground">Input Tokens</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={131072}
-                  value={inputTokens}
-                  onChange={(e) => setInputTokens(Math.max(1, Number(e.target.value)))}
-                  className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-[11px] text-muted-foreground">Output Tokens</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={131072}
-                  value={outputTokens}
-                  onChange={(e) => setOutputTokens(Math.max(1, Number(e.target.value)))}
-                  className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-primary/50"
-                />
-              </div>
+            <label className="mb-1.5 block text-sm font-medium">
+              Context Length: <span className="text-primary">{formatCtx(contextLength)}</span>
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={ctxValueToSlider(contextLength)}
+              onChange={(e) => setContextLength(ctxSliderToValue(Number(e.target.value)))}
+              className="w-full accent-primary"
+            />
+            <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+              <span>1K</span>
+              <span>4K</span>
+              <span>16K</span>
+              <span>64K</span>
+              <span>128K</span>
             </div>
           </div>
 
@@ -1026,7 +1020,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                 <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground">E2E</div>
                   <div className="mt-1 text-lg font-bold text-foreground">{formatLatency(interpolated.e2eMs)}</div>
-                  <div className="mt-0.5 text-[10px] text-muted-foreground">{inputTokens} in / 128 out</div>
+                  <div className="mt-0.5 text-[10px] text-muted-foreground">{contextLength} in / {OUTPUT_TOKENS} out</div>
                 </div>
               </div>
               <p className="mb-4 text-[10px] text-muted-foreground">
@@ -1062,7 +1056,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
               <div className="rounded-lg bg-muted/50 p-3">
                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground">E2E</div>
                 <div className={`mt-1 font-bold text-foreground ${interpolated ? "text-sm" : "text-lg"}`}>{formatLatency(result.e2eMs)}</div>
-                <div className="mt-0.5 text-[10px] text-muted-foreground">{inputTokens} in / {outputTokens} out</div>
+                <div className="mt-0.5 text-[10px] text-muted-foreground">{contextLength} in / {OUTPUT_TOKENS} out</div>
               </div>
             </div>
           </div>
@@ -1202,11 +1196,11 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
             </div>
             <div className="mt-1 flex flex-wrap justify-between gap-x-4 border-t border-border pt-2">
               <span>TTFT</span>
-              <span className="text-right">2 &times; {result.activeParamsB.toFixed(1)}B &times; {inputTokens.toLocaleString()} tokens / ({result.numGpus} &times; {gpu.tflops} TFLOPS &times; 35%)</span>
+              <span className="text-right">(linear + attention FLOPs for {contextLength.toLocaleString()} tokens) / (TP{result.tp} &times; {gpu.tflops} TFLOPS &times; 35%) &times; concurrency factor</span>
             </div>
             <div className="flex flex-wrap justify-between gap-x-4">
               <span>TPOT</span>
-              <span className="text-right">{(result.activeParamsB * PRECISION[quant].bytesPerParam).toFixed(1)} GB / ({result.numGpus} &times; {gpu.bw} GB/s &times; 65%)</span>
+              <span className="text-right">(weights/TP{result.tp} + KV for ~{(contextLength + OUTPUT_TOKENS / 2).toLocaleString()} seq len) / (TP{result.tp} &times; {gpu.bw} GB/s &times; 65%) &times; {concurrentRequests / result.dp} batch</span>
             </div>
           </div>
         </div>
@@ -1221,8 +1215,8 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
             <>
               <p className="mb-3 text-[10px] text-muted-foreground">
                 Actual results on {GPU_KEY_TO_BENCHMARK[gpuType]} at {matchingBenchmarks[0].ctx.toLocaleString()} input tokens
-                (closest to your {inputTokens.toLocaleString()}).
-                8 GPUs, {matchingBenchmarks[0].concurrency} concurrent, {matchingBenchmarks[0].numPrompts} prompts, 128 output tokens.
+                (closest to your {contextLength.toLocaleString()}).
+                8 GPUs, {matchingBenchmarks[0].concurrency} concurrent, {matchingBenchmarks[0].numPrompts} prompts, {OUTPUT_TOKENS} output tokens.
               </p>
               <div className="-mx-4 overflow-x-auto px-4 sm:-mx-6 sm:px-6">
                 <table className="w-full min-w-[480px] text-xs">
@@ -1250,9 +1244,9 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                   </tbody>
                 </table>
               </div>
-              {matchingBenchmarks[0].ctx !== inputTokens && (
+              {matchingBenchmarks[0].ctx !== contextLength && (
                 <p className="mt-2 text-[10px] text-muted-foreground">
-                  Note: Closest available context length is {matchingBenchmarks[0].ctx.toLocaleString()} (you selected {inputTokens.toLocaleString()}).
+                  Note: Closest available context length is {matchingBenchmarks[0].ctx.toLocaleString()} (you selected {contextLength.toLocaleString()}).
                 </p>
               )}
             </>
