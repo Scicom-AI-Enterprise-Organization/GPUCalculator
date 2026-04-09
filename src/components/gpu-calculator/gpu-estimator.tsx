@@ -66,12 +66,14 @@ interface InterpolatedEstimate {
 }
 
 interface EstimationResult {
-  modelVram: number;
-  kvCacheVram: number;
-  overheadVram: number;
-  totalVram: number;
+  modelVram: number;  // per GPU
+  kvCacheVram: number;  // per GPU
+  overheadVram: number;  // per GPU
+  totalVram: number;  // per GPU
   gpuVram: number;
   numGpus: number;
+  tp: number;
+  dp: number;
   tpRecommendation: string;
   utilizationPercent: number;
   kvPerTokenBytes: number;
@@ -173,7 +175,7 @@ function estimateGpus(
   const kv = KV_PRECISION[kvPrecision];
   const gpu = GPU_SPECS[gpuType];
 
-  const modelVram = paramsB * q.bytesPerParam;
+  const modelVramTotal = paramsB * q.bytesPerParam; // GB, total model weights
 
   const activeRatio = computeActiveRatio(isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts);
   const activeParamsB = paramsB * activeRatio;
@@ -184,35 +186,74 @@ function estimateGpus(
   } else {
     kvPerTokenBytes = paramsB * 0.00003 * 1e9 * (kv.bytes / 2);
   }
-  const kvCacheVram = (kvPerTokenBytes * contextLength * concurrentRequests) / 1e9;
+  const kvCacheVramTotal = (kvPerTokenBytes * contextLength * concurrentRequests) / 1e9;
 
-  const overheadVram = activeParamsB * q.bytesPerParam * 0.1;
+  const overheadVramTotal = activeParamsB * q.bytesPerParam * 0.1;
 
-  const totalVram = modelVram + kvCacheVram + overheadVram;
+  // Per-GPU VRAM with TP/DP:
+  // - Model weights: sharded across TP, replicated across DP → per GPU = modelVram / tp
+  // - KV cache: split across DP shards, sharded across TP → per GPU = kvCache / (tp * dp)
+  // - Overhead: sharded across TP → per GPU = overhead / tp
+  // Find minimum (tp, dp) where per-GPU VRAM fits
+  // Maximize TP (power of 2), then find minimum DP
 
-  const rawGpus = totalVram / gpu.vram;
-  let numGpus: number;
-  if (rawGpus <= 1) {
+  let bestTp = 1;
+  let bestDp = 1;
+  let numGpus = 1;
+
+  const fitsOnGpu = (tp: number, dp: number) => {
+    const perGpu = modelVramTotal / tp
+      + kvCacheVramTotal / (tp * dp)
+      + overheadVramTotal / tp;
+    return perGpu <= gpu.vram;
+  };
+
+  if (fitsOnGpu(1, 1)) {
+    bestTp = 1;
+    bestDp = 1;
     numGpus = 1;
   } else {
-    numGpus = 1;
-    while (numGpus < rawGpus) numGpus *= 2;
+    // Try TP values from highest to lowest, find min DP for each
+    const tpCandidates = [8, 4, 2];
+    let found = false;
+    for (const tp of tpCandidates) {
+      // Find minimum DP that fits
+      for (let dp = 1; dp <= 64; dp++) {
+        if (fitsOnGpu(tp, dp)) {
+          bestTp = tp;
+          bestDp = dp;
+          numGpus = tp * dp;
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) {
+      // Fallback: TP8 with large DP
+      bestTp = 8;
+      bestDp = Math.ceil(kvCacheVramTotal / (8 * gpu.vram)) + 1;
+      numGpus = bestTp * bestDp;
+    }
   }
+
+  // Compute per-GPU breakdown for display
+  const modelVram = modelVramTotal / bestTp;
+  const kvCacheVram = kvCacheVramTotal / (bestTp * bestDp);
+  const overheadVram = overheadVramTotal / bestTp;
+  const totalVram = modelVram + kvCacheVram + overheadVram;
 
   let tpRecommendation: string;
   if (numGpus === 1) {
     tpRecommendation = "No parallelism needed";
-  } else if (numGpus <= 2) {
-    tpRecommendation = `TP${numGpus}`;
-  } else if (numGpus <= 8) {
-    tpRecommendation = `TP${numGpus} or TP${numGpus / 2}/DP2`;
+  } else if (bestDp === 1) {
+    tpRecommendation = `TP${bestTp}`;
   } else {
-    const tp = Math.min(numGpus, 8);
-    const dp = numGpus / tp;
-    tpRecommendation = `TP${tp}/DP${dp} (multi-node)`;
+    tpRecommendation = `TP${bestTp}/DP${bestDp}`;
+    if (numGpus > 8) tpRecommendation += " (multi-node)";
   }
 
-  const utilizationPercent = (totalVram / (numGpus * gpu.vram)) * 100;
+  const utilizationPercent = (totalVram / gpu.vram) * 100;
 
   // --- Latency estimation ---
 
@@ -244,6 +285,8 @@ function estimateGpus(
     totalVram,
     gpuVram: gpu.vram,
     numGpus,
+    tp: bestTp,
+    dp: bestDp,
     tpRecommendation,
     utilizationPercent,
     kvPerTokenBytes,
@@ -1030,37 +1073,37 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
           </p>
         </div>
 
-        {/* VRAM Breakdown */}
+        {/* VRAM Breakdown — Per GPU */}
         <div className="rounded-xl border border-border bg-card p-4 sm:p-6">
-          <h4 className="mb-3 text-sm font-semibold">VRAM Breakdown</h4>
+          <h4 className="mb-3 text-sm font-semibold">VRAM Breakdown (per GPU)</h4>
           <div className="space-y-3">
             <VramBar
               label="Model Weights"
               value={result.modelVram}
-              total={result.numGpus * result.gpuVram}
+              total={result.gpuVram}
               color="#3b82f6"
             />
             <VramBar
               label="KV Cache"
               value={result.kvCacheVram}
-              total={result.numGpus * result.gpuVram}
+              total={result.gpuVram}
               color="#f97316"
             />
             <VramBar
               label={result.isMoe ? "Overhead (active)" : "Overhead"}
               value={result.overheadVram}
-              total={result.numGpus * result.gpuVram}
+              total={result.gpuVram}
               color="#6b7280"
             />
           </div>
           <div className="mt-4 border-t border-border pt-3">
             <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Total VRAM needed</span>
+              <span className="text-muted-foreground">VRAM per GPU</span>
               <span className="font-semibold">{result.totalVram.toFixed(1)} GB</span>
             </div>
             <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Available VRAM ({result.numGpus} GPUs)</span>
-              <span className="font-semibold">{(result.numGpus * result.gpuVram).toFixed(0)} GB</span>
+              <span className="text-muted-foreground">GPU VRAM</span>
+              <span className="font-semibold">{result.gpuVram.toFixed(0)} GB</span>
             </div>
             <div className="flex justify-between text-sm">
               <span className="text-muted-foreground">Utilization</span>
@@ -1068,6 +1111,50 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
             </div>
           </div>
         </div>
+
+        {/* VRAM Breakdown — Overall */}
+        {result.numGpus > 1 && (() => {
+          const overallModel = result.modelVram * result.tp * result.dp;
+          const overallKv = result.kvCacheVram * result.tp * result.dp;
+          const overallOverhead = result.overheadVram * result.tp * result.dp;
+          const overallTotal = overallModel + overallKv + overallOverhead;
+          const overallAvailable = result.numGpus * result.gpuVram;
+          return (
+            <div className="rounded-xl border border-border bg-card p-4 sm:p-6">
+              <h4 className="mb-3 text-sm font-semibold">VRAM Breakdown (overall across {result.numGpus} GPUs)</h4>
+              <div className="space-y-3">
+                <VramBar
+                  label="Model Weights"
+                  value={overallModel}
+                  total={overallAvailable}
+                  color="#3b82f6"
+                />
+                <VramBar
+                  label="KV Cache"
+                  value={overallKv}
+                  total={overallAvailable}
+                  color="#f97316"
+                />
+                <VramBar
+                  label={result.isMoe ? "Overhead (active)" : "Overhead"}
+                  value={overallOverhead}
+                  total={overallAvailable}
+                  color="#6b7280"
+                />
+              </div>
+              <div className="mt-4 border-t border-border pt-3">
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Total VRAM needed</span>
+                  <span className="font-semibold">{overallTotal.toFixed(1)} GB</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Available VRAM ({result.numGpus} GPUs)</span>
+                  <span className="font-semibold">{overallAvailable.toFixed(0)} GB</span>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Quick Reference */}
         <div className="overflow-hidden rounded-xl border border-border bg-card p-4 sm:p-6">
@@ -1081,8 +1168,8 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
           </h4>
           <div className="space-y-2 text-xs text-muted-foreground">
             <div className="flex flex-wrap justify-between gap-x-4">
-              <span>Model weights</span>
-              <span className="text-right">{paramsB}B &times; {PRECISION[quant].bytesPerParam} bytes/param = {result.modelVram.toFixed(1)} GB</span>
+              <span>Model weights / GPU</span>
+              <span className="text-right">{paramsB}B &times; {PRECISION[quant].bytesPerParam} bytes{result.tp > 1 ? ` / TP${result.tp}` : ""} = {result.modelVram.toFixed(1)} GB</span>
             </div>
             {result.isMoe && (
               <div className="flex flex-wrap justify-between gap-x-4">
@@ -1102,15 +1189,15 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
               </span>
             </div>
             <div className="flex flex-wrap justify-between gap-x-4">
-              <span>KV cache total</span>
+              <span>KV cache / GPU</span>
               <span className="text-right">
-                {(result.kvPerTokenBytes / 1024).toFixed(1)} KB &times; {contextLength.toLocaleString()} tokens &times; {concurrentRequests} req = {result.kvCacheVram.toFixed(1)} GB
+                {(result.kvPerTokenBytes / 1024).toFixed(1)} KB &times; {contextLength.toLocaleString()} tokens &times; {concurrentRequests} req{result.numGpus > 1 ? ` / ${result.numGpus} GPUs` : ""} = {result.kvCacheVram.toFixed(1)} GB
               </span>
             </div>
             <div className="flex flex-wrap justify-between gap-x-4">
-              <span>Framework overhead</span>
+              <span>Framework overhead / GPU</span>
               <span className="text-right">
-                ~10% of {result.isMoe ? `${result.activeParamsB.toFixed(1)}B active` : "model"} = {result.overheadVram.toFixed(1)} GB
+                ~10% of {result.isMoe ? `${result.activeParamsB.toFixed(1)}B active` : "model"}{result.tp > 1 ? ` / TP${result.tp}` : ""} = {result.overheadVram.toFixed(1)} GB
               </span>
             </div>
             <div className="mt-1 flex flex-wrap justify-between gap-x-4 border-t border-border pt-2">
