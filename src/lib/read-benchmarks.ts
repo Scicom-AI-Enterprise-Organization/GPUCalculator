@@ -50,6 +50,9 @@ function parseVllmFile(filePath: string, gpuDir: string, modelDir: string): Benc
     const raw = fs.readFileSync(filePath, "utf-8");
     const data = JSON.parse(raw);
 
+    // Skip failed benchmarks (all requests failed, metrics are 0)
+    if (data.completed === 0 || data.total_token_throughput === 0) return null;
+
     const fileName = path.basename(filePath, ".json");
     const match = fileName.match(/run_\d+_TP(\d+)_DP(\d+)_CTX(\d+)/);
     if (!match) return null;

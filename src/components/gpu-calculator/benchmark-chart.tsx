@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef, useCallback } from "react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import {
   ScatterChart,
   Scatter,
@@ -44,29 +45,83 @@ function getColor(model: string) {
   return MODEL_COLORS[model] || "#6b7280";
 }
 
-interface FilterSelectProps {
+interface MultiFilterProps {
   label: string;
-  value: string;
+  selected: Set<string>;
   options: string[];
-  onChange: (v: string) => void;
+  onChange: (v: Set<string>) => void;
 }
 
-function FilterSelect({ label, value, options, onChange }: FilterSelectProps) {
+function MultiFilter({ label, selected, options, onChange }: MultiFilterProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  const allSelected = selected.size === 0;
+
+  const toggle = (val: string) => {
+    const next = new Set(selected);
+    if (next.has(val)) next.delete(val);
+    else next.add(val);
+    onChange(next);
+  };
+
+  const displayText = allSelected
+    ? "All"
+    : selected.size === 1
+      ? [...selected][0]
+      : `${selected.size} selected`;
+
   return (
-    <div className="flex flex-col gap-1">
+    <div className="relative flex flex-col gap-1" ref={ref}>
       <label className="text-xs font-medium text-muted-foreground">{label}</label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
       >
-        <option value="All">All</option>
-        {options.map((o) => (
-          <option key={o} value={o}>
-            {o}
-          </option>
-        ))}
-      </select>
+        <span className="truncate">{displayText}</span>
+        <svg className="ml-1 h-3 w-3 shrink-0 opacity-50" viewBox="0 0 12 12"><path d="M3 5l3 3 3-3" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>
+      </button>
+      {open && (
+        <div className="absolute top-full left-0 z-50 mt-1 max-h-60 min-w-[160px] overflow-y-auto rounded-md border border-border bg-background py-1 shadow-lg">
+          <label className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={() => onChange(new Set())}
+              className="rounded"
+            />
+            All
+          </label>
+          {options.map((o) => (
+            <label key={o} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+              <input
+                type="checkbox"
+                checked={allSelected || selected.has(o)}
+                onChange={() => {
+                  if (allSelected) {
+                    // switching from "All" to selecting everything except this one
+                    const next = new Set(options);
+                    next.delete(o);
+                    onChange(next);
+                  } else {
+                    toggle(o);
+                  }
+                }}
+                className="rounded"
+              />
+              {o}
+            </label>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -98,26 +153,50 @@ function CustomTooltip({ active, payload }: CustomTooltipProps) {
   );
 }
 
+function parseParam(v: string | null): Set<string> {
+  if (!v) return new Set();
+  return new Set(v.split(",").filter(Boolean));
+}
+
 export function BenchmarkChart({ data }: { data: BenchmarkData }) {
-  const [gpuFilter, setGpuFilter] = useState("All");
-  const [modelFilter, setModelFilter] = useState("All");
-  const [engineFilter, setEngineFilter] = useState("All");
-  const [configFilter, setConfigFilter] = useState("All");
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  const [gpuFilter, setGpuFilter] = useState<Set<string>>(() => parseParam(searchParams.get("gpu")));
+  const [modelFilter, setModelFilter] = useState<Set<string>>(() => parseParam(searchParams.get("model")));
+  const [engineFilter, setEngineFilter] = useState<Set<string>>(() => parseParam(searchParams.get("engine")));
+  const [configFilter, setConfigFilter] = useState<Set<string>>(() => parseParam(searchParams.get("config")));
+  const [logScale, setLogScale] = useState(() => searchParams.get("log") === "1");
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
     setMounted(true);
   }, []);
 
+  // Sync filter state to URL query params
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (gpuFilter.size > 0) params.set("gpu", [...gpuFilter].join(","));
+    if (modelFilter.size > 0) params.set("model", [...modelFilter].join(","));
+    if (engineFilter.size > 0) params.set("engine", [...engineFilter].join(","));
+    if (configFilter.size > 0) params.set("config", [...configFilter].join(","));
+    if (logScale) params.set("log", "1");
+    const qs = params.toString();
+    router.replace(`${pathname}${qs ? `?${qs}` : ""}`, { scroll: false });
+  }, [gpuFilter, modelFilter, engineFilter, configFilter, logScale, router, pathname]);
+
   const filteredPoints = useMemo(() => {
     return data.points.filter((p) => {
-      if (gpuFilter !== "All" && p.gpu !== gpuFilter) return false;
-      if (modelFilter !== "All" && p.model !== modelFilter) return false;
-      if (engineFilter !== "All" && p.engine !== engineFilter) return false;
-      if (configFilter !== "All" && p.config !== configFilter) return false;
+      if (gpuFilter.size > 0 && !gpuFilter.has(p.gpu)) return false;
+      if (modelFilter.size > 0 && !modelFilter.has(p.model)) return false;
+      if (engineFilter.size > 0 && !engineFilter.has(p.engine)) return false;
+      if (configFilter.size > 0 && !configFilter.has(p.config)) return false;
+      // Exclude zero values when log scale is on — they break log scale
+      if (logScale && (p.throughputPerGpu <= 0 || p.e2eLatency <= 0)) return false;
       return true;
     });
-  }, [data.points, gpuFilter, modelFilter, engineFilter, configFilter]);
+  }, [data.points, gpuFilter, modelFilter, engineFilter, configFilter, logScale]);
 
   const series = useMemo(() => {
     const grouped = new Map<string, (BenchmarkPoint & { seriesKey: string })[]>();
@@ -139,10 +218,27 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
     <div className="min-w-0">
       {/* Filters */}
       <div className="mb-6 flex flex-wrap gap-4">
-        <FilterSelect label="GPU Type" value={gpuFilter} options={data.gpus} onChange={setGpuFilter} />
-        <FilterSelect label="Model" value={modelFilter} options={data.models} onChange={setModelFilter} />
-        <FilterSelect label="Engine" value={engineFilter} options={data.engines} onChange={setEngineFilter} />
-        <FilterSelect label="Parallelism" value={configFilter} options={data.configs} onChange={setConfigFilter} />
+        <MultiFilter label="GPU Type" selected={gpuFilter} options={data.gpus} onChange={setGpuFilter} />
+        <MultiFilter label="Model" selected={modelFilter} options={data.models} onChange={setModelFilter} />
+        <MultiFilter label="Engine" selected={engineFilter} options={data.engines} onChange={setEngineFilter} />
+        <MultiFilter label="Parallelism" selected={configFilter} options={data.configs} onChange={setConfigFilter} />
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-muted-foreground">Log Scale</label>
+          <button
+            role="switch"
+            aria-checked={logScale}
+            onClick={() => setLogScale((v) => !v)}
+            className={`relative inline-flex h-[28px] w-[48px] items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary/50 ${
+              logScale ? "bg-primary" : "bg-border"
+            }`}
+          >
+            <span
+              className={`inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                logScale ? "translate-x-[22px]" : "translate-x-[4px]"
+              }`}
+            />
+          </button>
+        </div>
       </div>
 
       {/* Chart */}
@@ -161,9 +257,11 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
               dataKey="throughputPerGpu"
               name="Throughput/GPU"
               unit=" tok/s"
+              {...(logScale ? { scale: "log" as const, domain: ["dataMin", "dataMax"], allowDataOverflow: true } : {})}
               tick={{ fontSize: 10 }}
+              tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : String(Math.round(v))}
               label={{
-                value: "Throughput/GPU (tok/s)",
+                value: `Throughput/GPU (tok/s)${logScale ? " — log scale" : ""}`,
                 position: "bottom",
                 offset: 0,
                 style: { fontSize: 10 },
@@ -174,9 +272,11 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
               dataKey="e2eLatency"
               name="E2E Latency"
               unit="s"
+              {...(logScale ? { scale: "log" as const, domain: ["dataMin", "dataMax"], allowDataOverflow: true } : {})}
               tick={{ fontSize: 10 }}
+              tickFormatter={(v: number) => v >= 1 ? `${v.toFixed(0)}` : v.toFixed(2)}
               label={{
-                value: "E2E Latency (s)",
+                value: `E2E Latency (s)${logScale ? " — log scale" : ""}`,
                 angle: -90,
                 position: "insideLeft",
                 offset: 10,
