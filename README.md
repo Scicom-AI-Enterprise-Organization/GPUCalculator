@@ -1,69 +1,53 @@
 # GPU Calculator
 
-LLM inference benchmark dashboard and GPU estimator.
+LLM inference benchmark dashboard and GPU cost estimator.
 
-## Benchmark Results (`/`)
+## Features
 
-Interactive scatter plot of Token Throughput per GPU vs End-to-End Latency. Filter by GPU type, model, inference engine (vLLM / SGLang), and parallelism config.
+### Benchmark Results (`/`)
+
+Interactive scatter plot comparing **Token Throughput per GPU** vs **End-to-End Latency** and **TTFT vs Context Length** across different hardware and software configurations.
+
+- Multi-select filters for GPU, model, engine, and parallelism config
+- Log scale toggle for better visualization of wide data ranges
+- Pareto frontier overlay highlighting optimal throughput-latency tradeoffs
+- Shareable URLs — filter state is encoded in query params
 
 ![Benchmark Results](benchmark-results.png)
 
-## GPU Estimator (`/gpu-estimator`)
+### GPU Estimator (`/gpu-estimator`)
 
 Estimate GPU count, VRAM usage, and latency for LLM inference.
 
 ![GPU Calculator](gpu-calculator.png)
 
-### Inputs
+**Inputs:** HuggingFace `config.json` link (auto-detects architecture, MoE, KV heads), model size, precision (FP32/BF16/FP8/INT8/INT4), KV cache precision, context length (2K–128K), request shape, concurrency (1–256), target GPU.
 
-- **HuggingFace Config** — Paste a link to a model's `config.json` for precise KV cache estimation using actual layer count, KV heads, and head dimensions. Auto-detects MoE architecture.
-- **Model Size** — Total parameter count (1B-1000B)
-- **MoE** — Toggle for Mixture of Experts models. Configure total experts, active experts per token, and shared experts. All weights stay in VRAM but activation overhead and decode bandwidth are based on active parameters only.
-- **Precision** — Model weight precision: FP32, BF16/FP16, FP8, INT8, INT4/GPTQ/AWQ
-- **KV Cache Precision** — Separate from model precision: BF16/FP16 (default) or FP8
-- **Context Length** — 2K to 128K tokens
-- **Request Shape** — Input and output token counts for latency estimation
-- **Concurrent Requests** — 1 to 256
-- **Target GPU** — B200, H200 SXM, H100 SXM, A100 SXM/PCIe, L40S, A10, RTX 4090
+**Outputs:** GPU count (power-of-2 for TP), TP/DP recommendation, VRAM breakdown (weights, KV cache, activations).
 
-### Outputs
+**Latency estimation** is shown two ways:
 
-- Estimated GPU count (rounded to power of 2 for tensor parallelism)
-- TP/DP parallelism recommendation
-- VRAM breakdown: model weights, KV cache, activation overhead
+| Method | How it works |
+|--------|-------------|
+| Data-driven | Log-linear interpolation from real benchmarks, by architecture type (MoE vs dense) |
+| Theoretical | `TTFT = 2 * active_params * input_tokens / (GPUs * TFLOPS * 35%)`, `TPOT = model_bytes / (GPUs * BW * 65%)` |
 
-### Latency Estimation
+## Benchmark Coverage
 
-Two approaches shown side by side:
+| Engine | GPUs | Models |
+|--------|------|--------|
+| vLLM | B200, H100 SXM, H200 SXM | GLM-4.7, GLM-4.7-FP8, GPT-OSS-120B, Llama-3.1-70B, Qwen3-8B/14B/32B |
+| SGLang | A100 SXM, H100 SXM, H200 SXM | GPT-OSS-120B, Llama-3.1-70B, Qwen3-8B/14B, Qwen3.5-27B/35B/122B |
 
-**Data-driven (interpolated)** — Log-linear interpolation from real benchmark data, separated by architecture type (MoE vs dense). Uses active parameters as the interpolation axis. Available for B200, H200 SXM, H100 SXM, and A100 SXM.
-
-**Theoretical (FLOPS / bandwidth)** — Fallback for GPUs without benchmark data.
-
-| Phase | Bound by | Formula |
-|-------|----------|---------|
-| TTFT (prefill) | Compute | `2 * active_params * input_tokens / (num_gpus * TFLOPS * 35%)` |
-| TPOT (decode) | Memory BW | `active_model_bytes / (num_gpus * bandwidth * 65%)` |
-| E2E | Both | `TTFT + output_tokens * TPOT` |
-
-### Benchmark Models
-
-| Model | Type | Total Params | Active Params |
-|-------|------|-------------|---------------|
-| GPT-OSS-120B | MoE | 120B | 5.1B |
-| GLM-4.7 | MoE | 358B | 32B |
-| GLM-4.7-FP8 | MoE | 358B | 32B |
-| Qwen3-32B | Dense | 32B | 32B |
-
-## Benchmark Data
-
-Sourced from [llm-benchmaq](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) as a git submodule under `data/llm-benchmaq/`.
+Data sourced from [llm-benchmaq](https://github.com/Scicom-AI-Enterprise-Organization/llm-benchmaq) (git submodule at `data/llm-benchmaq/`).
 
 ## Setup
 
 ```bash
 git clone --recurse-submodules https://github.com/Scicom-AI-Enterprise-Organization/GPUCalculator.git
 cd GPUCalculator
+npm install
+npm run dev
 ```
 
 If already cloned without submodules:
@@ -72,14 +56,7 @@ If already cloned without submodules:
 git submodule update --init --remote
 ```
 
-## Running Locally
-
-```bash
-npm install
-npm run dev
-```
-
-## Docker
+### Docker
 
 ```bash
 docker compose up --build
@@ -87,4 +64,4 @@ docker compose up --build
 
 ## Tech Stack
 
-- [Next.js 16](https://nextjs.org), [React 19](https://react.dev), [Recharts](https://recharts.org), [Tailwind CSS v4](https://tailwindcss.com), [Radix UI](https://www.radix-ui.com)
+Next.js 16, React 19, Recharts, Tailwind CSS v4, Radix UI
