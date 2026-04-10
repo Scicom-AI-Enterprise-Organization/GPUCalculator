@@ -14,6 +14,8 @@ import {
   ZAxis,
   Cell,
   LabelList,
+  Line,
+  LineChart,
 } from "recharts";
 import type { BenchmarkData, BenchmarkPoint } from "@/lib/read-benchmarks";
 
@@ -153,6 +155,44 @@ function CustomTooltip({ active, payload }: CustomTooltipProps) {
   );
 }
 
+// Compute Pareto frontier: highest throughput for a given latency (or lower)
+// A point is Pareto-optimal if no other point has both higher throughput AND lower latency.
+function computePareto(points: BenchmarkPoint[]): BenchmarkPoint[] {
+  if (points.length === 0) return [];
+  // Sort by throughput descending
+  const sorted = [...points].sort((a, b) => b.throughputPerGpu - a.throughputPerGpu);
+  const frontier: BenchmarkPoint[] = [];
+  let minLatency = Infinity;
+  for (const p of sorted) {
+    if (p.e2eLatency <= minLatency) {
+      frontier.push(p);
+      minLatency = p.e2eLatency;
+    }
+  }
+  // Sort by throughput ascending for line drawing
+  frontier.sort((a, b) => a.throughputPerGpu - b.throughputPerGpu);
+  return frontier;
+}
+
+function TtftTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: BenchmarkPoint & { seriesKey: string } }> }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
+  return (
+    <div className="rounded-lg border border-border bg-background/95 p-3 shadow-lg backdrop-blur">
+      <div className="mb-2 font-semibold text-foreground">
+        {d.model} on {d.gpu}
+      </div>
+      <div className="space-y-1 text-xs text-muted-foreground">
+        <div>Engine: <span className="text-foreground">{d.engine}</span></div>
+        <div>Config: <span className="text-foreground">{d.config}</span></div>
+        <div>Context: <span className="text-foreground">{d.ctx.toLocaleString()} tokens</span></div>
+        <div>TTFT: <span className="text-foreground">{d.ttft.toFixed(0)}ms</span></div>
+        <div>Throughput/GPU: <span className="text-foreground">{d.throughputPerGpu.toLocaleString()} tok/s</span></div>
+      </div>
+    </div>
+  );
+}
+
 function parseParam(v: string | null): Set<string> {
   if (!v) return new Set();
   return new Set(v.split(",").filter(Boolean));
@@ -214,6 +254,14 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
 
   const seriesEntries = useMemo(() => [...series.entries()], [series]);
 
+  const paretoFrontier = useMemo(() => computePareto(filteredPoints), [filteredPoints]);
+
+  // Key to force Recharts remount when filters change (Recharts can stale-cache series)
+  const chartKey = useMemo(
+    () => [...series.keys()].join("|"),
+    [series],
+  );
+
   return (
     <div className="min-w-0">
       {/* Filters */}
@@ -250,7 +298,7 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
         <div className="h-[350px] w-full min-w-0 sm:h-[500px]">
         {mounted ? (
         <ResponsiveContainer width="100%" height="100%">
-          <ScatterChart margin={{ top: 10, right: 10, bottom: 20, left: 0 }}>
+          <ScatterChart key={`tp-${chartKey}`} margin={{ top: 10, right: 10, bottom: 20, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" className="opacity-30" />
             <XAxis
               type="number"
@@ -314,6 +362,97 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
                       if (n >= 1000) return `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}K`;
                       return String(n);
                     }) as (label: unknown) => string}
+                  />
+                </Scatter>
+              );
+            })}
+            {/* Pareto frontier */}
+            {paretoFrontier.length > 1 && (
+              <Scatter
+                name="Pareto Frontier"
+                data={paretoFrontier}
+                fill="none"
+                stroke="#e11d48"
+                strokeWidth={2.5}
+                line={{ strokeDasharray: "0" }}
+                legendType="plainline"
+                shape={() => null}
+              />
+            )}
+          </ScatterChart>
+        </ResponsiveContainer>
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            Loading chart…
+          </div>
+        )}
+        </div>
+      </div>
+
+      {/* TTFT Chart */}
+      <div className="mt-6 rounded-xl border border-border bg-card p-2 sm:p-4">
+        <h3 className="mb-1 text-sm font-semibold sm:text-base">Time to First Token (TTFT) vs Context Length</h3>
+        <p className="mb-4 text-xs text-muted-foreground">
+          Lower is better &middot; Each line is a unique engine + model + parallelism config
+        </p>
+        <div className="h-[350px] w-full min-w-0 sm:h-[400px]">
+        {mounted ? (
+        <ResponsiveContainer width="100%" height="100%">
+          <ScatterChart key={`ttft-${chartKey}`} margin={{ top: 10, right: 10, bottom: 20, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" className="opacity-30" />
+            <XAxis
+              type="number"
+              dataKey="ctx"
+              name="Context Length"
+              tick={{ fontSize: 10 }}
+              tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : String(v)}
+              label={{
+                value: "Context Length (tokens)",
+                position: "bottom",
+                offset: 0,
+                style: { fontSize: 10 },
+              }}
+            />
+            <YAxis
+              type="number"
+              dataKey="ttft"
+              name="TTFT"
+              unit="ms"
+              tick={{ fontSize: 10 }}
+              tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}`}
+              label={{
+                value: "TTFT (ms)",
+                angle: -90,
+                position: "insideLeft",
+                offset: 10,
+                style: { fontSize: 10 },
+              }}
+              width={50}
+            />
+            <ZAxis range={[20, 20]} />
+            <Tooltip content={<TtftTooltip />} />
+            <Legend
+              wrapperStyle={{ fontSize: 10, paddingTop: 8, lineHeight: "1.6" }}
+            />
+            {seriesEntries.map(([key, pts]) => {
+              const sample = pts[0];
+              const color = getColor(sample.model);
+              const label = `${sample.model} (${sample.engine}, ${sample.config})`;
+              return (
+                <Scatter
+                  key={key}
+                  name={label}
+                  data={pts}
+                  fill={color}
+                  stroke={color}
+                  strokeWidth={2}
+                  line={{ strokeDasharray: sample.engine === "SGLang" ? "6 3" : undefined }}
+                  legendType={GPU_SHAPES[sample.gpu] as "circle" | "diamond" | "square" | "triangle" || "circle"}
+                >
+                  <LabelList
+                    dataKey="gpu"
+                    position="top"
+                    style={{ fontSize: 8, fill: color }}
                   />
                 </Scatter>
               );
