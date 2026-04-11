@@ -54,12 +54,23 @@ function parseVllmFile(filePath: string, gpuDir: string, modelDir: string): Benc
     if (data.completed === 0 || data.total_token_throughput === 0) return null;
 
     const fileName = path.basename(filePath, ".json");
-    const match = fileName.match(/run_\d+_TP(\d+)_DP(\d+)_CTX(\d+)/);
-    if (!match) return null;
-
-    const tp = parseInt(match[1]);
-    const dp = parseInt(match[2]);
-    const ctx = parseInt(match[3]);
+    // Two naming conventions:
+    //   (1) run_N_TP{tp}_DP{dp}_CTX{ctx}_C{c}_P{p}_O{o}         — b200 set
+    //   (2) ..._TP{tp}_DP{dp}_in{ctx}_out{o}_p{p}_c{c}_{hash}   — h100/h200 set (incl. multi-concurrency)
+    let tp: number, dp: number, ctx: number;
+    const m1 = fileName.match(/_TP(\d+)_DP(\d+)_CTX(\d+)/);
+    const m2 = fileName.match(/_TP(\d+)_DP(\d+)_in(\d+)_out\d+_p\d+_c\d+/i);
+    if (m1) {
+      tp = parseInt(m1[1]);
+      dp = parseInt(m1[2]);
+      ctx = parseInt(m1[3]);
+    } else if (m2) {
+      tp = parseInt(m2[1]);
+      dp = parseInt(m2[2]);
+      ctx = parseInt(m2[3]);
+    } else {
+      return null;
+    }
     const gpu = GPU_LABEL_MAP[gpuDir] || gpuDir;
 
     return {

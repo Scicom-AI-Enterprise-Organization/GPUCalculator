@@ -1,8 +1,17 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
-import { Loader2, CheckCircle2, XCircle, Link as LinkIcon, Database } from "lucide-react";
+import { useState, useMemo, useCallback, useEffect } from "react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
+import { Loader2, CheckCircle2, XCircle, Link as LinkIcon, Database, Info } from "lucide-react";
 import type { BenchmarkData, BenchmarkPoint } from "@/lib/read-benchmarks";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 
 // vram in GB, tflops = FP16 dense TFLOPS, bw = memory bandwidth in GB/s
 const GPU_SPECS: Record<string, { vram: number; tflops: number; bw: number; label: string }> = {
@@ -359,51 +368,6 @@ function logLerp(x: number, x0: number, x1: number, y0: number, y1: number): num
   return Math.exp(logY);
 }
 
-// Interpolate a metric across context lengths for a given set of points (same model+gpu+config)
-function interpolateByCtx(
-  points: BenchmarkPoint[],
-  targetCtx: number,
-  metric: (p: BenchmarkPoint) => number
-): { value: number; confidence: "interpolated" | "extrapolated" | "nearest" } | null {
-  if (points.length === 0) return null;
-
-  const sorted = [...points].sort((a, b) => a.ctx - b.ctx);
-  const ctxValues = sorted.map((p) => p.ctx);
-
-  // Exact match
-  const exact = sorted.find((p) => p.ctx === targetCtx);
-  if (exact) return { value: metric(exact), confidence: "interpolated" };
-
-  // Single point — nearest
-  if (sorted.length === 1) return { value: metric(sorted[0]), confidence: "nearest" };
-
-  // Within range — interpolate
-  if (targetCtx >= ctxValues[0] && targetCtx <= ctxValues[ctxValues.length - 1]) {
-    // Find surrounding points
-    let lo = sorted[0], hi = sorted[1];
-    for (let i = 0; i < sorted.length - 1; i++) {
-      if (sorted[i].ctx <= targetCtx && sorted[i + 1].ctx >= targetCtx) {
-        lo = sorted[i];
-        hi = sorted[i + 1];
-        break;
-      }
-    }
-    return {
-      value: logLerp(targetCtx, lo.ctx, hi.ctx, metric(lo), metric(hi)),
-      confidence: "interpolated",
-    };
-  }
-
-  // Outside range — extrapolate from nearest two points
-  const [a, b] = targetCtx < ctxValues[0]
-    ? [sorted[0], sorted[1]]
-    : [sorted[sorted.length - 2], sorted[sorted.length - 1]];
-  return {
-    value: Math.max(0, logLerp(targetCtx, a.ctx, b.ctx, metric(a), metric(b))),
-    confidence: "extrapolated",
-  };
-}
-
 // Interpolate a metric across model sizes
 function interpolateByModelSize(
   sizeMetricPairs: { size: number; value: number }[],
@@ -445,6 +409,53 @@ function interpolateByModelSize(
   };
 }
 
+// Pick the nearest available concurrency bucket for a given set of points.
+// Prefers exact match, then the closest-by-ratio (so 12→10 is closer than 12→25 on a log axis).
+function nearestConcurrency(points: BenchmarkPoint[], target: number): number | null {
+  const available = [...new Set(points.map((p) => p.concurrency))];
+  if (available.length === 0) return null;
+  return available.reduce((best, c) =>
+    Math.abs(Math.log(c) - Math.log(target)) < Math.abs(Math.log(best) - Math.log(target)) ? c : best
+  );
+}
+
+// Reduce a per-ctx group of points (varying concurrency) to a single (ctx, metricValue)
+// pair at the target concurrency using log-log interp/extrap across concurrency.
+// Returns null unless we either (a) have the target concurrency exactly or
+// (b) have at least two distinct concurrencies to span/extrapolate from.
+// Otherwise a model whose ctx group only has one observed concurrency would pin
+// the result at its single value and drown out the cross-concurrency signal.
+function metricAtConcurrency(
+  pts: BenchmarkPoint[],
+  targetConcurrency: number,
+  metric: (p: BenchmarkPoint) => number
+): { value: number; confidence: "interpolated" | "extrapolated" | "nearest" } | null {
+  // Collapse duplicates at the same concurrency (e.g. vLLM + SGLang) by averaging
+  const byCc = new Map<number, number[]>();
+  for (const p of pts) {
+    const c = p.concurrency;
+    if (!byCc.has(c)) byCc.set(c, []);
+    byCc.get(c)!.push(metric(p));
+  }
+  const pairs = [...byCc.entries()].map(([c, vs]) => ({
+    size: c,
+    value: vs.reduce((a, b) => a + b, 0) / vs.length,
+  }));
+
+  // Single observed concurrency: only usable if it equals the target.
+  if (pairs.length < 2) {
+    const only = pairs[0];
+    if (only && only.size === targetConcurrency) {
+      return { value: only.value, confidence: "interpolated" };
+    }
+    return null;
+  }
+
+  const res = interpolateByModelSize(pairs, targetConcurrency);
+  if (!res || res.confidence === "nearest") return null;
+  return res;
+}
+
 function interpolateFromBenchmarks(
   points: BenchmarkPoint[],
   gpuKey: string,
@@ -452,6 +463,7 @@ function interpolateFromBenchmarks(
   targetCtx: number,
   targetIsMoe: boolean,
   targetActiveParamsB: number,
+  targetConcurrency: number,
 ): InterpolatedEstimate | null {
   const gpuLabel = GPU_KEY_TO_BENCHMARK[gpuKey];
   if (!gpuLabel) return null;
@@ -467,75 +479,65 @@ function interpolateFromBenchmarks(
     modelGroups.get(key)!.push(p);
   }
 
-  // For each model, interpolate by context length first
-  // Use active params as the interpolation axis — this makes MoE and dense comparable
   const sizeToThroughput: { size: number; value: number }[] = [];
   const sizeToTtft: { size: number; value: number }[] = [];
   const sizeToE2e: { size: number; value: number }[] = [];
   const usedModels: string[] = [];
+  const confidences: ("interpolated" | "extrapolated" | "nearest")[] = [];
 
-  for (const [modelName, modelPoints] of modelGroups) {
+  const runModel = (modelName: string, modelPoints: BenchmarkPoint[]) => {
     const meta = BENCHMARK_MODELS[modelName];
-    if (!meta) continue;
-
-    // Filter by architecture: match MoE with MoE, dense with dense
-    // If no same-architecture matches exist, we'll fall back to all models below
-    if (meta.isMoe !== targetIsMoe) continue;
+    if (!meta) return;
 
     // Use TP8/DP1 config if available for consistency
     const tp8Points = modelPoints.filter((p) => p.config === "TP8/DP1");
     const usePoints = tp8Points.length > 0 ? tp8Points : modelPoints;
 
-    // Deduplicate by ctx (pick best throughput per ctx)
-    const byCtx = new Map<number, BenchmarkPoint>();
+    // Group by ctx, then collapse each ctx across concurrency → single metric value
+    const byCtx = new Map<number, BenchmarkPoint[]>();
     for (const p of usePoints) {
-      const existing = byCtx.get(p.ctx);
-      if (!existing || p.throughputPerGpu > existing.throughputPerGpu) {
-        byCtx.set(p.ctx, p);
-      }
+      if (!byCtx.has(p.ctx)) byCtx.set(p.ctx, []);
+      byCtx.get(p.ctx)!.push(p);
     }
-    const dedupedPoints = [...byCtx.values()];
 
-    // Use active params as the size axis for interpolation
+    const ctxThroughput: { size: number; value: number }[] = [];
+    const ctxTtft: { size: number; value: number }[] = [];
+    const ctxE2e: { size: number; value: number }[] = [];
+
+    for (const [ctx, pts] of byCtx) {
+      const t = metricAtConcurrency(pts, targetConcurrency, (p) => p.throughputPerGpu);
+      const f = metricAtConcurrency(pts, targetConcurrency, (p) => p.ttft);
+      const e = metricAtConcurrency(pts, targetConcurrency, (p) => p.e2eLatency * 1000);
+      if (t) { ctxThroughput.push({ size: ctx, value: t.value }); confidences.push(t.confidence); }
+      if (f) { ctxTtft.push({ size: ctx, value: f.value }); confidences.push(f.confidence); }
+      if (e) { ctxE2e.push({ size: ctx, value: e.value }); confidences.push(e.confidence); }
+    }
+
+    // Now interpolate across ctx to target ctx (reuse log-log pair interpolator)
+    const throughputResult = interpolateByModelSize(ctxThroughput, targetCtx);
+    const ttftResult = interpolateByModelSize(ctxTtft, targetCtx);
+    const e2eResult = interpolateByModelSize(ctxE2e, targetCtx);
+
     const interpSize = meta.activeB;
+    if (throughputResult) { sizeToThroughput.push({ size: interpSize, value: throughputResult.value }); confidences.push(throughputResult.confidence); }
+    if (ttftResult) { sizeToTtft.push({ size: interpSize, value: ttftResult.value }); confidences.push(ttftResult.confidence); }
+    if (e2eResult) { sizeToE2e.push({ size: interpSize, value: e2eResult.value }); confidences.push(e2eResult.confidence); }
+    if (throughputResult || ttftResult || e2eResult) {
+      usedModels.push(`${modelName}(${interpSize}B active)`);
+    }
+  };
 
-    const throughputResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.throughputPerGpu);
-    const ttftResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.ttft);
-    const e2eResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.e2eLatency * 1000);
-
-    if (throughputResult) sizeToThroughput.push({ size: interpSize, value: throughputResult.value });
-    if (ttftResult) sizeToTtft.push({ size: interpSize, value: ttftResult.value });
-    if (e2eResult) sizeToE2e.push({ size: interpSize, value: e2eResult.value });
-    usedModels.push(`${modelName}(${interpSize}B active)`);
+  // First pass: only same-architecture models
+  for (const [modelName, modelPoints] of modelGroups) {
+    const meta = BENCHMARK_MODELS[modelName];
+    if (!meta || meta.isMoe !== targetIsMoe) continue;
+    runModel(modelName, modelPoints);
   }
 
   // Fall back to all models if no same-architecture matches
   if (sizeToThroughput.length === 0) {
     for (const [modelName, modelPoints] of modelGroups) {
-      const meta = BENCHMARK_MODELS[modelName];
-      if (!meta) continue;
-
-      const tp8Points = modelPoints.filter((p) => p.config === "TP8/DP1");
-      const usePoints = tp8Points.length > 0 ? tp8Points : modelPoints;
-
-      const byCtx = new Map<number, BenchmarkPoint>();
-      for (const p of usePoints) {
-        const existing = byCtx.get(p.ctx);
-        if (!existing || p.throughputPerGpu > existing.throughputPerGpu) {
-          byCtx.set(p.ctx, p);
-        }
-      }
-      const dedupedPoints = [...byCtx.values()];
-      const interpSize = meta.activeB;
-
-      const throughputResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.throughputPerGpu);
-      const ttftResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.ttft);
-      const e2eResult = interpolateByCtx(dedupedPoints, targetCtx, (p) => p.e2eLatency * 1000);
-
-      if (throughputResult) sizeToThroughput.push({ size: interpSize, value: throughputResult.value });
-      if (ttftResult) sizeToTtft.push({ size: interpSize, value: ttftResult.value });
-      if (e2eResult) sizeToE2e.push({ size: interpSize, value: e2eResult.value });
-      usedModels.push(`${modelName}(${interpSize}B active)`);
+      runModel(modelName, modelPoints);
     }
   }
 
@@ -550,16 +552,18 @@ function interpolateFromBenchmarks(
 
   if (!throughputEst || !ttftEst || !e2eEst) return null;
 
-  const worstConfidence = [throughputEst, ttftEst, e2eEst].some((e) => e.confidence === "extrapolated")
+  confidences.push(throughputEst.confidence, ttftEst.confidence, e2eEst.confidence);
+  const worstConfidence = confidences.some((c) => c === "extrapolated")
     ? "extrapolated"
-    : [throughputEst, ttftEst, e2eEst].some((e) => e.confidence === "nearest")
+    : confidences.some((c) => c === "nearest")
       ? "nearest"
       : "interpolated";
 
   // Build description
   const archLabel = targetIsMoe ? "MoE" : "dense";
   const ctxValues = [...new Set(gpuPoints.map((p) => p.ctx))].sort((a, b) => a - b);
-  const basedOn = `${gpuLabel} ${archLabel} data: ${usedModels.join(", ")} at ${ctxValues.map((c) => c >= 1000 ? `${(c / 1000)}K` : c).join(", ")} ctx`;
+  const ccValues = [...new Set(gpuPoints.map((p) => p.concurrency))].sort((a, b) => a - b);
+  const basedOn = `${gpuLabel} ${archLabel} data @ c=${targetConcurrency} (from c=${ccValues.join("/")}): ${usedModels.join(", ")} at ${ctxValues.map((c) => c >= 1000 ? `${(c / 1000)}K` : c).join(", ")} ctx`;
 
   return {
     throughputPerGpu: Math.max(1, Math.round(throughputEst.value)),
@@ -574,12 +578,18 @@ function findMatchingBenchmarks(
   points: BenchmarkPoint[],
   gpuKey: string,
   inputTokens: number,
+  targetConcurrency: number,
 ): BenchmarkPoint[] {
   const gpuLabel = GPU_KEY_TO_BENCHMARK[gpuKey];
   if (!gpuLabel) return [];
 
   // Find benchmarks matching the GPU
-  const gpuMatches = points.filter((p) => p.gpu === gpuLabel);
+  const gpuAll = points.filter((p) => p.gpu === gpuLabel);
+  if (gpuAll.length === 0) return [];
+
+  // Snap to the nearest available concurrency for this GPU
+  const cc = nearestConcurrency(gpuAll, targetConcurrency);
+  const gpuMatches = cc != null ? gpuAll.filter((p) => p.concurrency === cc) : gpuAll;
   if (gpuMatches.length === 0) return [];
 
   // Find the closest context length available
@@ -622,26 +632,227 @@ function formatLatency(ms: number): string {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+function HowItWorksDialog() {
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <button
+          type="button"
+          aria-label="How this works"
+          className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <Info className="h-3 w-3" />
+          How this works
+        </button>
+      </DialogTrigger>
+      <DialogContent className="max-h-[85vh] w-[95vw] !max-w-4xl overflow-y-auto sm:!max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>How the calculator works</DialogTitle>
+          <DialogDescription>
+            A quick tour of what the numbers mean and where they come from.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-5 text-sm leading-relaxed">
+          <section>
+            <h4 className="mb-1 font-semibold text-foreground">1. VRAM budget &amp; GPU count</h4>
+            <p className="text-muted-foreground">
+              Per-GPU VRAM = <code className="text-foreground">model / TP + KV cache / (TP × DP) + ~10% overhead / TP</code>.
+              The smallest <code className="text-foreground">(TP, DP)</code> combo whose per-GPU VRAM fits the chosen GPU wins — preferring higher TP first, then the minimum DP.
+              For MoE, all weights still reside in VRAM, but the active-parameter count drives compute and overhead.
+            </p>
+          </section>
+
+          <section>
+            <h4 className="mb-1 font-semibold text-foreground">2. KV cache per token</h4>
+            <p className="text-muted-foreground">
+              With a HuggingFace config: <code className="text-foreground">2 × num_layers × num_kv_heads × head_dim × kv_bytes</code>.
+              Without one, a rough heuristic from total parameter count is used — loading a config gives much more accurate VRAM.
+            </p>
+          </section>
+
+          <section>
+            <h4 className="mb-1 font-semibold text-foreground">3. Theoretical latency (FLOPs / bandwidth model)</h4>
+            <ul className="ml-4 list-disc space-y-1 text-muted-foreground">
+              <li>
+                <span className="font-medium text-foreground">TTFT (prefill, compute-bound)</span>:{" "}
+                <code className="text-foreground">(2 × active_params × in_tokens + 2 × layers × in_tokens² × hidden) / (TP × TFLOPS × 35%)</code>,
+                multiplied by a concurrency factor.
+              </li>
+              <li>
+                <span className="font-medium text-foreground">TPOT (decode, bandwidth-bound)</span>:{" "}
+                <code className="text-foreground">(weights/TP + KV for avg seq len) / (TP × mem_bw × 65%)</code>,
+                scaled by batch size per DP shard.
+              </li>
+              <li>
+                <span className="font-medium text-foreground">E2E</span> = TTFT + out_tokens × TPOT.
+              </li>
+            </ul>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              The 35% / 65% utilization constants are rough averages observed on vLLM/SGLang in production-style workloads.
+            </p>
+          </section>
+
+          <section>
+            <h4 className="mb-1 font-semibold text-foreground">4. Data-driven latency (real benchmarks)</h4>
+            <p className="text-muted-foreground">
+              When available, the primary numbers come from real <code className="text-foreground">vllm bench serve</code> /
+              SGLang runs on RunPod (B200, H200 SXM, H100 SXM, A100 SXM) across multiple models, context lengths,
+              and concurrency levels.
+            </p>
+
+            <p className="mt-3 text-muted-foreground">
+              <span className="font-medium text-foreground">Core primitive — log–log interpolation.</span>{" "}
+              Given two bracketing points <code className="text-foreground">(x₀, y₀)</code> and{" "}
+              <code className="text-foreground">(x₁, y₁)</code>, the value at target <code className="text-foreground">x</code> is:
+            </p>
+            <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 text-[11px] leading-5 text-foreground">
+{`y(x) = exp( log(y₀) + t · (log(y₁) − log(y₀)) )
+where t = (log(x) − log(x₀)) / (log(x₁) − log(x₀))
+
+equivalently a local power law:
+y(x) = y₀ · (x / x₀) ^ k,   k = log(y₁ / y₀) / log(x₁ / x₀)`}
+            </pre>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Inside the observed range → <em>interpolated</em>; outside → same formula applied to the two outermost
+              points → <em>extrapolated</em>. If any yᵢ ≤ 0 the estimator falls back to plain linear interpolation.
+              Applied three times in sequence below (concurrency → context → model size).
+            </p>
+
+            <p className="mt-3 text-muted-foreground">
+              For each metric <code className="text-foreground">M ∈ {"{"}TTFT, throughput/GPU, E2E{"}"}</code>{" "}
+              the pipeline for target concurrency <code className="text-foreground">c*</code>, context{" "}
+              <code className="text-foreground">L*</code>, active params <code className="text-foreground">P*</code> is:
+            </p>
+            <ol className="ml-4 list-decimal space-y-2 text-muted-foreground">
+              <li>
+                <span className="font-medium text-foreground">Filter.</span> Keep points with matching GPU and
+                architecture (MoE ↔ MoE, dense ↔ dense). For each model, prefer TP8/DP1 rows if present.
+              </li>
+              <li>
+                <span className="font-medium text-foreground">Stage A — collapse concurrency.</span> For every
+                <code className="text-foreground"> (model, ctx = L)</code> group with observed concurrencies{" "}
+                <code className="text-foreground">{"{c₁, …, cₙ}"}</code>:
+                <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 text-[11px] leading-5 text-foreground">
+{`M_model(L, c*) = loglog_interp( {(cᵢ, M(cᵢ))}, c* )`}
+                </pre>
+                <span className="text-[11px]">
+                  Skipped if the group has only 1 distinct cᵢ and cᵢ ≠ c* — otherwise that single point would pin
+                  the result and swamp the concurrency signal.
+                </span>
+              </li>
+              <li>
+                <span className="font-medium text-foreground">Stage B — interpolate across context.</span>{" "}
+                Using the Stage A outputs as <code className="text-foreground">(L, M_model(L, c*))</code> pairs:
+                <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 text-[11px] leading-5 text-foreground">
+{`M_model(L*, c*) = loglog_interp( {(Lⱼ, M_model(Lⱼ, c*))}, L* )`}
+                </pre>
+              </li>
+              <li>
+                <span className="font-medium text-foreground">Stage C — interpolate across active model size.</span>{" "}
+                Collect one <code className="text-foreground">(Pₘ, M_model(L*, c*))</code> pair per eligible model
+                (Pₘ = meta.activeB), then:
+                <pre className="mt-1 overflow-x-auto rounded-md bg-muted p-3 text-[11px] leading-5 text-foreground">
+{`M(P*, L*, c*) = loglog_interp( {(Pₘ, M_model(L*, c*))}, P* )`}
+                </pre>
+                <span className="text-[11px]">
+                  For MoE targets <code className="text-foreground">P* = target_active_params_B</code>; for dense{" "}
+                  <code className="text-foreground">P* = total_params_B</code>. This makes dense and MoE comparable
+                  on a single axis.
+                </span>
+              </li>
+            </ol>
+
+            <p className="mt-3 text-muted-foreground">
+              <span className="font-medium text-foreground">Confidence propagation.</span> Each stage reports
+              <em> interpolated</em> / <em>extrapolated</em> / <em>nearest</em>; the final confidence is the worst of
+              all three (extrapolated &gt; nearest &gt; interpolated). Shown as the badge next to{" "}
+              <em>Data-driven (…)</em> in the result card.
+            </p>
+          </section>
+
+          <section>
+            <h4 className="mb-1 font-semibold text-foreground">5. Benchmark reference table</h4>
+            <p className="text-muted-foreground">
+              Shows raw benchmark rows, snapping to the nearest observed context length and the nearest observed
+              concurrency bucket (log distance) — these are measurements, not fits.
+            </p>
+          </section>
+
+          <section>
+            <h4 className="mb-1 font-semibold text-foreground">Caveats</h4>
+            <ul className="ml-4 list-disc space-y-1 text-muted-foreground">
+              <li>Theoretical latency ignores scheduler, pipelining, speculative decoding, prefix caching.</li>
+              <li>VRAM overhead is a flat 10% — real-world framework overhead varies.</li>
+              <li>Data-driven numbers reflect the specific engine/version used in the benchmark runs.</li>
+              <li>Extrapolation beyond the measured grid (especially high concurrency) should be treated as a directional estimate only.</li>
+            </ul>
+          </section>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }) {
-  const [paramsB, setParamsB] = useState(70);
-  const [quant, setQuant] = useState("bf16");
-  const [kvPrecision, setKvPrecision] = useState("bf16");
-  const [contextLength, setContextLength] = useState(8192);
-  const [gpuType, setGpuType] = useState("h100");
-  const [concurrentRequests, setConcurrentRequests] = useState(10);
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  const getNum = useCallback((k: string, d: number) => {
+    const v = searchParams.get(k);
+    if (v == null) return d;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : d;
+  }, [searchParams]);
+  const getStr = useCallback((k: string, d: string) => searchParams.get(k) ?? d, [searchParams]);
+  const getBool = useCallback((k: string, d: boolean) => {
+    const v = searchParams.get(k);
+    if (v == null) return d;
+    return v === "1" || v === "true";
+  }, [searchParams]);
+
+  const [paramsB, setParamsB] = useState(() => getNum("params", 70));
+  const [quant, setQuant] = useState(() => getStr("quant", "bf16"));
+  const [kvPrecision, setKvPrecision] = useState(() => getStr("kv", "bf16"));
+  const [contextLength, setContextLength] = useState(() => getNum("ctx", 8192));
+  const [gpuType, setGpuType] = useState(() => getStr("gpu", "h100"));
+  const [concurrentRequests, setConcurrentRequests] = useState(() => getNum("cc", 10));
   const OUTPUT_TOKENS = 128;
 
   // MoE settings
-  const [isMoe, setIsMoe] = useState(false);
-  const [moeNumExperts, setMoeNumExperts] = useState(8);
-  const [moeActiveExperts, setMoeActiveExperts] = useState(2);
-  const [moeSharedExperts, setMoeSharedExperts] = useState(0);
+  const [isMoe, setIsMoe] = useState(() => getBool("moe", false));
+  const [moeNumExperts, setMoeNumExperts] = useState(() => getNum("moe_n", 8));
+  const [moeActiveExperts, setMoeActiveExperts] = useState(() => getNum("moe_a", 2));
+  const [moeSharedExperts, setMoeSharedExperts] = useState(() => getNum("moe_s", 0));
 
   // HuggingFace config
-  const [hfUrl, setHfUrl] = useState("");
+  const [hfUrl, setHfUrl] = useState(() => getStr("hf", ""));
   const [hfConfig, setHfConfig] = useState<ModelConfig | null>(null);
   const [hfLoading, setHfLoading] = useState(false);
   const [hfError, setHfError] = useState<string | null>(null);
+
+  // Sync state → URL query params
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (paramsB !== 70) params.set("params", String(paramsB));
+    if (quant !== "bf16") params.set("quant", quant);
+    if (kvPrecision !== "bf16") params.set("kv", kvPrecision);
+    if (contextLength !== 8192) params.set("ctx", String(contextLength));
+    if (gpuType !== "h100") params.set("gpu", gpuType);
+    if (concurrentRequests !== 10) params.set("cc", String(concurrentRequests));
+    if (isMoe) params.set("moe", "1");
+    if (isMoe && moeNumExperts !== 8) params.set("moe_n", String(moeNumExperts));
+    if (isMoe && moeActiveExperts !== 2) params.set("moe_a", String(moeActiveExperts));
+    if (isMoe && moeSharedExperts !== 0) params.set("moe_s", String(moeSharedExperts));
+    if (hfUrl.trim()) params.set("hf", hfUrl.trim());
+    const qs = params.toString();
+    router.replace(`${pathname}${qs ? `?${qs}` : ""}`, { scroll: false });
+  }, [
+    paramsB, quant, kvPrecision, contextLength, gpuType, concurrentRequests,
+    isMoe, moeNumExperts, moeActiveExperts, moeSharedExperts, hfUrl,
+    router, pathname,
+  ]);
 
   const fetchHfConfig = useCallback(async () => {
     if (!hfUrl.trim()) return;
@@ -681,6 +892,14 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
     setHfError(null);
   }, []);
 
+  // Auto-load HF config on mount if a URL was seeded from query params
+  useEffect(() => {
+    if (hfUrl.trim() && !hfConfig && !hfLoading) {
+      fetchHfConfig();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const result = useMemo(
     () =>
       estimateGpus(
@@ -696,23 +915,26 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
   const gpu = GPU_SPECS[gpuType];
 
   const matchingBenchmarks = useMemo(
-    () => findMatchingBenchmarks(benchmarkData.points, gpuType, contextLength),
-    [benchmarkData.points, gpuType, contextLength]
+    () => findMatchingBenchmarks(benchmarkData.points, gpuType, contextLength, concurrentRequests),
+    [benchmarkData.points, gpuType, contextLength, concurrentRequests]
   );
 
   const interpolated = useMemo(
     () => interpolateFromBenchmarks(
       benchmarkData.points, gpuType, paramsB, contextLength,
-      isMoe, result.activeParamsB
+      isMoe, result.activeParamsB, concurrentRequests
     ),
-    [benchmarkData.points, gpuType, paramsB, contextLength, isMoe, result.activeParamsB]
+    [benchmarkData.points, gpuType, paramsB, contextLength, isMoe, result.activeParamsB, concurrentRequests]
   );
 
   return (
     <div className="grid min-w-0 gap-6 lg:grid-cols-2">
       {/* Input Panel */}
       <div className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-6">
-        <h3 className="mb-4 text-base font-semibold">Configuration</h3>
+        <div className="mb-4 flex items-center justify-between gap-2">
+          <h3 className="text-base font-semibold">Configuration</h3>
+          <HowItWorksDialog />
+        </div>
         <div className="space-y-5">
           {/* HuggingFace Config URL */}
           <div>
@@ -1030,7 +1252,7 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
                     ? "Extrapolated beyond available data range — treat as rough estimate."
                     : "Based on nearest available data point."}
                 {" "}{interpolated.basedOn}.
-                {" "}100 concurrent requests, 128 output tokens.
+                {" "}{concurrentRequests} concurrent requests, 128 output tokens.
               </p>
             </>
           )}

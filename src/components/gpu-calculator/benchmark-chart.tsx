@@ -228,6 +228,8 @@ export function BenchmarkChart({ data }: { data: BenchmarkData }) {
 
   const filteredPoints = useMemo(() => {
     return data.points.filter((p) => {
+      // Benchmark plot fixed at 100 concurrent requests for cross-run comparability
+      if (p.concurrency !== 100) return false;
       if (gpuFilter.size > 0 && !gpuFilter.has(p.gpu)) return false;
       if (modelFilter.size > 0 && !modelFilter.has(p.model)) return false;
       if (engineFilter.size > 0 && !engineFilter.has(p.engine)) return false;
