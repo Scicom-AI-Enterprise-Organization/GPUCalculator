@@ -230,21 +230,28 @@ function estimateGpus(
     bestDp = 1;
     numGpus = 1;
   } else {
-    // Try TP values from highest to lowest, find min DP for each
-    const tpCandidates = [8, 4, 2];
+    // Try all TP/DP combinations within a single node (<=8 GPUs) first,
+    // pick the one with the fewest total GPUs
+    const tpCandidates = [2, 4, 6, 8];
     let found = false;
+    let bestNumGpus = Infinity;
     for (const tp of tpCandidates) {
       // Find minimum DP that fits
       for (let dp = 1; dp <= 64; dp++) {
         if (fitsOnGpu(tp, dp)) {
-          bestTp = tp;
-          bestDp = dp;
-          numGpus = tp * dp;
-          found = true;
-          break;
+          const total = tp * dp;
+          if (total < bestNumGpus) {
+            bestTp = tp;
+            bestDp = dp;
+            bestNumGpus = total;
+          }
+          break; // dp=1 is always best for this tp, no need to go higher
         }
       }
-      if (found) break;
+    }
+    if (bestNumGpus < Infinity) {
+      numGpus = bestNumGpus;
+      found = true;
     }
     if (!found) {
       // Fallback: TP8 with large DP
