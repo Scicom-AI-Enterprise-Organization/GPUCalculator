@@ -38,18 +38,18 @@ const KV_PRECISION: Record<string, { bytes: number; label: string }> = {
   fp8:  { bytes: 1, label: "FP8" },
 };
 
-// Log-scale context length: slider 0–100 maps to 1024–131072
-const CTX_MIN = 1024;
-const CTX_MAX = 131072;
-const CTX_LOG_MIN = Math.log2(CTX_MIN);
-const CTX_LOG_MAX = Math.log2(CTX_MAX);
+// Log-scale context length: slider 0–700 maps to 1024–131072
+// Using 700 so powers of 2 land on exact integer positions (every 100 steps)
+const CTX_SLIDER_MAX = 700;
+const CTX_LOG_MIN = 10; // log2(1024)
+const CTX_LOG_MAX = 17; // log2(131072)
 function ctxSliderToValue(slider: number): number {
-  const log = CTX_LOG_MIN + (slider / 100) * (CTX_LOG_MAX - CTX_LOG_MIN);
+  const log = CTX_LOG_MIN + (slider / CTX_SLIDER_MAX) * (CTX_LOG_MAX - CTX_LOG_MIN);
   return Math.round(Math.pow(2, log));
 }
 function ctxValueToSlider(value: number): number {
-  const log = Math.log2(Math.max(CTX_MIN, Math.min(CTX_MAX, value)));
-  return Math.round(((log - CTX_LOG_MIN) / (CTX_LOG_MAX - CTX_LOG_MIN)) * 100);
+  const log = Math.log2(Math.max(Math.pow(2, CTX_LOG_MIN), Math.min(Math.pow(2, CTX_LOG_MAX), value)));
+  return Math.round(((log - CTX_LOG_MIN) / (CTX_LOG_MAX - CTX_LOG_MIN)) * CTX_SLIDER_MAX);
 }
 function formatCtx(value: number): string {
   if (value >= 1024) return `${(value / 1024).toFixed(value % 1024 === 0 ? 0 : 1)}K`;
@@ -1158,18 +1158,22 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
             <input
               type="range"
               min={0}
-              max={100}
+              max={CTX_SLIDER_MAX}
               step={1}
               value={ctxValueToSlider(contextLength)}
               onChange={(e) => setContextLength(ctxSliderToValue(Number(e.target.value)))}
               className="w-full accent-primary"
             />
-            <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
-              <span>1K</span>
-              <span>4K</span>
-              <span>16K</span>
-              <span>64K</span>
-              <span>128K</span>
+            <div className="relative mt-1 mx-[6px] h-4 text-[10px] text-muted-foreground">
+              {[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072].map((v, i) => (
+                <span
+                  key={v}
+                  className="absolute -translate-x-1/2"
+                  style={{ left: `${(i / 7) * 100}%` }}
+                >
+                  {formatCtx(v)}
+                </span>
+              ))}
             </div>
           </div>
 
@@ -1187,11 +1191,16 @@ export function GpuEstimator({ benchmarkData }: { benchmarkData: BenchmarkData }
               onChange={(e) => setConcurrentRequests(Number(e.target.value))}
               className="w-full accent-primary"
             />
-            <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
-              <span>1</span>
-              <span>64</span>
-              <span>128</span>
-              <span>256</span>
+            <div className="relative mt-1 mx-[6px] h-4 text-[10px] text-muted-foreground">
+              {[1, 64, 128, 256].map((v) => (
+                <span
+                  key={v}
+                  className="absolute -translate-x-1/2"
+                  style={{ left: `${((v - 1) / 255) * 100}%` }}
+                >
+                  {v}
+                </span>
+              ))}
             </div>
           </div>
 
