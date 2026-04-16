@@ -41,6 +41,10 @@ const openSans = Open_Sans({
 export const metadata: Metadata = {
   title: "GPU Calculator - Scicom AI",
   description: "GPU performance benchmark dashboard and VRAM estimator for LLM inference",
+  icons: {
+    icon: "/favicon.ico",
+    apple: "/icon-192.png",
+  },
 };
 
 export default function RootLayout({
